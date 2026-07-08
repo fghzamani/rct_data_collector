@@ -1,0 +1,55 @@
+# ============================================================================
+# RCT Collector - Default Configuration
+# ============================================================================
+# Copy this file and customize for your experiment.
+#
+# Usage:
+#   python3 -m rct_collector.main --config my_experiment.yaml
+# ============================================================================
+
+# --- Trial settings ---
+num_trials: 3000
+trial_timeout_sec: 180.0      # Max seconds per navigation attempt
+cooldown_sec: 5.0              # Seconds between trials (for process cleanup)
+
+# --- Map ---
+# Path to your map's YAML file (the one that points to the .pgm/.png)
+map_yaml_path: "/path/to/your/map.yaml"
+map_frame: "map"
+
+# --- Pose sampling ---
+min_goal_distance: 14.0         # Minimum Euclidean distance between start and goal (meters)
+max_goal_distance: 15.0        # Maximum distance
+obstacle_clearance_m: 0.5      # Min distance from any obstacle for sampled poses
+
+# Optional: restrict sampling to a subregion of the map (world coordinates)
+# sampling_bounds:
+#   x_min: -5.0
+#   x_max: 10.0
+#   y_min: -3.0
+#   y_max: 8.0
+
+# --- PAL OS integration ---
+pal_config_dir: "~/.pal/config"
+override_filename: "99_rct_override.yaml"  # Must be 90-99 prefix for PAL priority
+nav_module_name: "navigation"              # PAL module to restart
+
+# --- Output ---
+output_dir: "./rct_data"
+checkpoint_file: "checkpoint.json"
+results_csv: "rct_results.csv"
+
+# --- Robustness ---
+max_consecutive_failures: 10
+retry_on_nav_failure: false    # Don't retry! Failed trials = valid outcome data
+use_dynamic_reconfig: true     # Also set params via `ros2 param set` (belt-and-suspenders)
+restart_nav_module: true       # Restart PAL nav module to apply config changes
+
+# --- Gazebo ---
+reset_gazebo_between_trials: true
+
+# --- Risk features (Paper 2 extension) ---
+collect_risk_features: true
+risk_feature_topics:
+  scan: "/scan_raw"
+  costmap: "/local_costmap/costmap"
