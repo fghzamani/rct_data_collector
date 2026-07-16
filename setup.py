@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+import os
+from glob import glob
 
 package_name = "rct_collector"
 
@@ -15,6 +17,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/config", ["config/default_config.yaml"]),
         ("share/" + package_name + "/launch", ["launch/rct_collection.launch.py"]),
+        (os.path.join('share', package_name, 'behavior_trees'), glob('behavior_trees/*.xml')),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
