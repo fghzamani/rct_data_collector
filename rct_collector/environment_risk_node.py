@@ -17,7 +17,7 @@ Subscribes to:
     - /scan (sensor_msgs/LaserScan): LiDAR data
     - /odom or /mobile_base_controller/odom (nav_msgs/Odometry): Robot velocity
     - /amcl_pose (geometry_msgs/PoseWithCovarianceStamped): Robot pose
-    - /local_costmap/costmap (nav2_msgs/Costmap): Local costmap
+    - /global_costmap/costmap (nav2_msgs/Costmap): Global costmap # it was local costmap 
     - /plan (nav_msgs/Path): Current path for curvature computation
 
 Publishes:
@@ -564,7 +564,7 @@ class OptimizedRiskStateNode(Node):
         local_window = costmap[y_min:y_max, x_min:x_max]
         
         # Fraction of cells with lethal cost (254 in Nav2)
-        return float(np.mean(local_window >= 253))
+        return float(np.mean(local_window == 254))
     
     def _compute_r_width(self) -> float:
         """R_width: Corridor width perpendicular to heading."""
