@@ -1,0 +1,21 @@
+repositories:
+  gazebo_collision_monitor:
+    type: git
+    url: https://github.com/fghzamani/gazebo_collision_monitor.git
+    version: main
+  gazebo_simulation:
+    type: git
+    url: git@github.com:fghzamani/gazebo_simulation.git
+    version: main
+  pal_gazebo_worlds:
+    type: git
+    url: https://github.com/pal-robotics/pal_gazebo_worlds.git
+    version: humble-devel
+  tiago_navigation:
+    type: git
+    url: https://github.com/pal-robotics/tiago_navigation.git
+    version: humble-devel
+  rct_collector:
+    type: git
+    url: https://github.com/fghzamani/rct_data_collector
+    version: main
