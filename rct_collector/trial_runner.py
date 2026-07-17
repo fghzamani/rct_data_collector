@@ -58,11 +58,15 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from std_msgs.msg import Float64MultiArray, Bool
+from std_msgs.msg import Float64MultiArray, Bool, String
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from nav2_msgs.srv import GetCostmap
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+
+import threading
+from collections import deque
+from rclpy.executors import SingleThreadedExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +99,74 @@ def yaw_to_quaternion(yaw: float) -> tuple[float, float, float, float]:
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
     """(x, y, z, w) -> yaw (rad)."""
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+# ── Laser → base_link static transform ───────────────────────────────────────
+# The LiDAR reports ranges in its own frame (`base_laser_link` for the PMB2
+# sim). To measure distance from the robot's *base_link* origin every scan hit
+# is first lifted into base_link. That transform is static, so we hard-code it
+# here rather than pay a tf2 lookup per scan. It is (x, y, yaw) of the laser
+# frame expressed in base_link — verify against your robot's URDF (`base_link`
+# → laser joint) if you change platforms or mount the laser.
+LASER_TO_BASE_LINK = (0.202, 0.0, 0.0)   # PMB2 / TIAGo base front laser
+
+
+def _min_dist_base_link_to_obstacles(obstacles_xy: np.ndarray,
+                                     base_link_xy: tuple) -> float:
+    """Min Euclidean distance (m) from the robot's base_link origin to the
+    nearest obstacle point. Measures to the base_link POINT — NOT to the
+    footprint polygon — so it ignores the robot's shape/arm config.
+
+    obstacles_xy : (K, 2) obstacle points, in the same frame as base_link_xy
+                   (base_link for LiDAR hits; the map frame for static-map cells)
+    base_link_xy : (x, y) of the base_link origin in that frame
+                   ((0, 0) for LiDAR hits; the robot pose for the static map)
+
+    Always >= 0 (0 if an obstacle coincides with base_link). +inf if no points.
+    Fully vectorised: one subtract + hypot + min over the K points.
+    """
+    if obstacles_xy.shape[0] == 0:
+        return float("inf")
+    dx = obstacles_xy[:, 0] - base_link_xy[0]
+    dy = obstacles_xy[:, 1] - base_link_xy[1]
+    return float(np.sqrt(dx * dx + dy * dy).min())
+
+
+def _static_map_obstacles(map_yaml_path: str,
+                          occupied_thresh: float = 0.65) -> tuple[np.ndarray, float]:
+    """Load a map_server map (yaml + image) and return its occupied cells.
+
+    Returns (obstacles_xy, resolution) where obstacles_xy is (K, 2) world
+    coordinates (cell centres, map frame) of every occupied cell. Follows the
+    map_server convention: normalised occupancy is (1 - pixel/255), or pixel/255
+    when `negate: 1`; a cell is an obstacle when that value >= occupied_thresh
+    (the yaml's own `occupied_thresh` wins if present). Assumes the map origin
+    yaw is 0 (true for standard map_server maps). Computed once — the map is
+    static.
+    """
+    import yaml
+    from pathlib import Path
+    from PIL import Image
+
+    with open(map_yaml_path) as f:
+        info = yaml.safe_load(f)
+    res = float(info.get("resolution", 0.05))
+    origin = info.get("origin", [0.0, 0.0, 0.0])
+    ox, oy = float(origin[0]), float(origin[1])
+    negate = int(info.get("negate", 0))
+    occ_th = float(info.get("occupied_thresh", occupied_thresh))
+
+    img = np.array(Image.open(
+        Path(map_yaml_path).parent / info["image"]).convert("L"))
+    h = img.shape[0]
+    p = img.astype(np.float64) / 255.0
+    occ = p if negate else (1.0 - p)              # normalised occupancy prob.
+    rows, cols = np.where(occ >= occ_th)
+
+    # Image row 0 is the TOP of the map; map y grows upward → flip the row axis.
+    wx = ox + (cols + 0.5) * res
+    wy = oy + (h - 0.5 - rows) * res
+    return np.column_stack((wx, wy)), res
 
 
 def _min_distance_to_obstacle(costmap_array: np.ndarray, robot_rc: np.ndarray,
@@ -155,13 +227,23 @@ class TrialResult:
     path_length_m: float = 0.0                       # controller (executed) path
     global_path_length_m: float = 0.0               # planned global path
     goal_distance_remaining: float = 0.0
-    min_obstacle_distance: float = float("inf")     # closest LiDAR approach
+    min_obstacle_distance: float = float("inf")     # closest LiDAR approach (base_link → obstacle)
+    min_map_obstacle_distance: float = float("inf")  # closest static-map approach (base_link → obstacle)
     min_global_obstacle_distance: float = float("inf")  # along the planned path
+
+    # Navigation timing window (wall clock). Used to trim the continuously-recorded
+    # risk_state_history down to samples collected during navigation.
+    t_nav_start: float = 0.0
+    t_nav_end: float = 0.0
 
     # Bookkeeping for the rich JSON
     num_risk_samples: int = 0
     num_controller_samples: int = 0
     json_path: str = ""
+    
+    num_replans: int = 0
+    replan_history: list = field(default_factory=list)   # not written to CSV, only JSON
+    collision_links: list = field(default_factory=list)  # not written to CSV, only JSON
 
     def to_dict(self) -> dict[str, Any]:
         """Flat, single-level dict for CSV output."""
@@ -175,9 +257,11 @@ class TrialResult:
             "global_path_length_m": self.global_path_length_m,
             "goal_distance_remaining": self.goal_distance_remaining,
             "min_obstacle_distance": self.min_obstacle_distance,
+            "min_map_obstacle_distance": self.min_map_obstacle_distance,
             "min_global_obstacle_distance": self.min_global_obstacle_distance,
             "num_risk_samples": self.num_risk_samples,
             "num_controller_samples": self.num_controller_samples,
+            "num_replans": self.num_replans,
             "json_path": self.json_path,
         }
         for key, val in self.params.items():
@@ -207,13 +291,31 @@ class TrialRunnerNode(Node):
         self.angular_velocity = None
         self.min_scan_value: Optional[float] = None
         self.is_collided = False
+        self._recording = False
+        self._trial_id = -1
+
+        # base_link → nearest-obstacle distance state (LiDAR-based).
+        # Static laser pose in base_link; folded into the cached beam directions.
+        self._laser_tx, self._laser_ty, self._laser_yaw = LASER_TO_BASE_LINK
+        # Cached per-beam unit directions (base_link), keyed on scan geometry.
+        self._scan_key: Optional[tuple] = None
+        self._scan_ux: Optional[np.ndarray] = None
+        self._scan_uy: Optional[np.ndarray] = None
+
+        # base_link → nearest-obstacle distance state (static-map-based).
+        self._map_obstacles: Optional[np.ndarray] = None   # (K, 2) map-frame cells
+        self.min_map_value: Optional[float] = None
+        self.min_map_overall = float("inf")
 
         # Buffers (cleared per trial)
         self.latest_risk_state: Optional[RiskStateRecord] = None
         self.risk_state_history: list[RiskStateRecord] = []
         self.controller_path: list[dict] = []
         self.min_scan_overall = float("inf")
-
+        self.collision_links = []
+        
+        self.replan_events: deque = deque()
+        self.create_subscription(Path, "/plan", self._plan_callback, 5)
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -226,11 +328,27 @@ class TrialRunnerNode(Node):
         self.create_subscription(
             LaserScan, scan_topic, self._scan_callback, sensor_qos)
         self.create_subscription(Bool, "/gazebo/collision", self._collision_callback, 5)
+        self.create_subscription(String, "/gazebo/collision_info", self._collision_info_callback, 5)
         if collect_risk_features:
             self.create_subscription(
                 Float64MultiArray, risk_topic, self._risk_state_callback, 10)
 
     # ── callbacks ──
+    def _plan_callback(self, msg: Path):
+        if not self._recording:                     # gate: ignore plans between trials
+            return
+        n = len(msg.poses)
+        arr = np.empty((n, 3), dtype=np.float32)
+        for i, ps in enumerate(msg.poses):
+            p, o = ps.pose.position, ps.pose.orientation
+            arr[i] = (p.x, p.y, quaternion_to_yaw(o.x, o.y, o.z, o.w))
+        self.replan_events.append({
+            "timestamp": time.time(),
+            "trial_id": self._trial_id,             # stamp it; see note below
+            "poses": arr,
+            "path_msg": msg,
+        })
+    
     def _pose_callback(self, msg: PoseWithCovarianceStamped):
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
@@ -238,15 +356,61 @@ class TrialRunnerNode(Node):
         self.robot_y = p.y
         self.robot_yaw = quaternion_to_yaw(o.x, o.y, o.z, o.w)
 
+        # Static-map distance from base_link to the nearest obstacle at this pose
+        # (analogue of the LiDAR distance, from the ground-truth map). The
+        # base_link origin in the map frame is just the robot position.
+        if self._map_obstacles is not None:
+            d = _min_dist_base_link_to_obstacles(
+                self._map_obstacles, (self.robot_x, self.robot_y))
+            self.min_map_value = d
+            if math.isfinite(d):
+                self.min_map_overall = min(self.min_map_overall, d)
+
     def _odom_callback(self, msg: Odometry):
         self.linear_velocity = msg.twist.twist.linear
         self.angular_velocity = msg.twist.twist.angular
 
+    def set_static_obstacles(self, obstacles_xy: Optional[np.ndarray]) -> None:
+        """Cache the static-map occupied cells (map frame) used to measure the
+        base_link → nearest-obstacle distance. Set once per run; map is static."""
+        self._map_obstacles = obstacles_xy
+
+    def _ensure_scan_geometry(self, msg: LaserScan) -> None:
+        """(Re)build the cached per-beam unit directions in base_link.
+
+        Direction of beam i in base_link is (cos(yaw+θ_i), sin(yaw+θ_i)); folding
+        the static laser yaw in here means the callback only scales by range and
+        adds the laser translation. Recomputed only when the scan geometry
+        (angle_min / increment / beam count) changes — i.e. essentially once.
+        """
+        n = len(msg.ranges)
+        key = (msg.angle_min, msg.angle_increment, n)
+        if key == self._scan_key:
+            return
+        ang = (msg.angle_min
+               + np.arange(n, dtype=np.float64) * msg.angle_increment
+               + self._laser_yaw)
+        self._scan_ux = np.cos(ang)
+        self._scan_uy = np.sin(ang)
+        self._scan_key = key
+
     def _scan_callback(self, msg: LaserScan):
-        valid = [r for r in msg.ranges if msg.range_min < r < msg.range_max]
-        self.min_scan_value = min(valid) if valid else None
-        if self.min_scan_value is not None:
-            self.min_scan_overall = min(self.min_scan_overall, self.min_scan_value)
+        ranges = np.asarray(msg.ranges, dtype=np.float64)
+        valid = np.isfinite(ranges) & (ranges > msg.range_min) & (ranges < msg.range_max)
+        if not valid.any():
+            self.min_scan_value = None
+            return
+
+        self._ensure_scan_geometry(msg)
+        r = ranges[valid]
+        # Lift valid hits into base_link, then take the distance from the
+        # base_link origin (0, 0) to the nearest hit — NOT to the footprint.
+        px = self._laser_tx + r * self._scan_ux[valid]
+        py = self._laser_ty + r * self._scan_uy[valid]
+        d = float(np.sqrt(px * px + py * py).min())
+
+        self.min_scan_value = d
+        self.min_scan_overall = min(self.min_scan_overall, d)
 
     def _risk_state_callback(self, msg: Float64MultiArray):
         try:
@@ -261,6 +425,11 @@ class TrialRunnerNode(Node):
         if msg.data:
             self.get_logger().warn("Collision detected by Gazebo plugin!")
             self.is_collided = True
+
+    def _collision_info_callback(self, msg):
+        
+        self.get_logger().warn("Collision info received!")
+        self.collision_links.append({"t": time.time(), "info": msg.data})
 
     # ── recording ──
     def record_sample(self, footprint_cost: float):
@@ -286,6 +455,11 @@ class TrialRunnerNode(Node):
         self.controller_path = []
         self.min_scan_value = None
         self.min_scan_overall = float("inf")
+        self.min_map_value = None
+        self.min_map_overall = float("inf")
+        self.replan_events = deque()
+        self.is_collided = False         
+        self.collision_links = [] 
 
 
 # ── Trial runner ──────────────────────────────────────────────────────────────
@@ -312,6 +486,7 @@ class TrialRunner:
         save_per_trial_json: bool = True,
         generate_plots: bool = False,
         risk_topic: str = "/risk_state",
+        bt_xml_path: str = ""
     ):
         self.timeout_sec = timeout_sec
         self.collision_threshold = collision_threshold
@@ -327,20 +502,35 @@ class TrialRunner:
         self.save_per_trial_json = save_per_trial_json
         self.generate_plots = generate_plots
         self.risk_topic = risk_topic
+        self.bt_xml_path = bt_xml_path
 
         if not rclpy.ok():
             rclpy.init()
 
+        # Raw /plan messages buffered during navigation, analyzed after the trial
+        # ends so the recording loop is never blocked by costmap math.
+        self._pending_replans: list[dict] = []
+
+        # Static-map occupied cells (map frame), loaded lazily once and reused
+        # across trials for the pose-based footprint clearance.
+        self._static_obstacles: Optional[np.ndarray] = None
+        self._static_obstacles_loaded = False
+
         # Persistent recorder node + navigator + costmap client (created once).
         self._recorder = TrialRunnerNode(
             scan_topic, odom_topic, risk_topic, collect_risk_features)
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._recorder)
+        self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._spin_thread.start()
+
         self._navigator = BasicNavigator()
         logger.info("Waiting for Nav2 to become active...")
         self._navigator.waitUntilNav2Active()
         logger.info("Nav2 active ✓")
 
         self._costmap_cli = self._navigator.create_client(
-            GetCostmap, "/local_costmap/get_costmap")
+            GetCostmap, "/global_costmap/get_costmap")
 
         if self.save_per_trial_json:
             os.makedirs(os.path.join(self.output_dir, "trials"), exist_ok=True)
@@ -383,30 +573,40 @@ class TrialRunner:
         # self._navigator.setInitialPose(init_pose)
         self._publish_initial_pose(start_pose, cov=None, timeout_sec=2.0)
         self._wait_for_localization()
+        
+        # Wipe obstacle marks left by the previous trial / pre-teleport pose.
+        # Recovery behaviors (which normally do this) are absent from our BT.
+        self._navigator.clearAllCostmaps() 
 
         # 2. Resolve this trial's footprint and build the collision checker.
         footprint = self._resolve_footprint(params)
+        rec.set_static_obstacles(self._get_static_obstacles())  # base_link→obstacle (map)
         checker, costmap = self._build_footprint_checker(footprint)
         collision_distance = self.collision_threshold
         if checker is not None:
             collision_distance = checker.geometry.inscribed_radius + self.collision_margin
+            print (f"  Footprint inscribed radius ============= {checker.geometry.inscribed_radius:.3f} m, ")
+            print (f"  collision distance threshold =========== {collision_distance:.3f} m")
 
         # 3. Plan + analyse the global path.
         goal_stamped = self._make_pose_stamped(goal_pose)
-        path = self._navigator.getPath(init_pose, goal_stamped)
-        if path is None or not path.poses:
+        # One-time initial plan, purely for the baseline global-path record.
+        # Does NOT drive execution — goToPose() below computes its own first plan internally.
+        initial_path = self._navigator.getPath(init_pose, goal_stamped)
+        if initial_path is None or not initial_path.poses:
             result.status = "PLANNING_FAILED"
             self._finalize_json(rec, result, params, global_path=[])
-            logger.error("  Global planning failed — no path.")
+            logger.error("  Initial global planning failed — no path.")
             return result
 
         global_path_data, result.global_path_length_m, result.min_global_obstacle_distance = \
-            self._analyze_global_path(path, checker, costmap)
+            self._analyze_global_path(initial_path, checker, costmap)
 
         # 4. Follow the smoothed path while recording.
         # smoothed = self._navigator.smoothPath(path) or path
         # self._navigator.followPath(smoothed)
-        self._record_navigation(rec, checker, collision_distance, result)
+        self._navigator.goToPose(goal_stamped, behavior_tree=self.bt_xml_path)
+        self._record_navigation(rec, checker, collision_distance, result, checker, costmap)
 
         # 5. Classify outcome (collision overrides the Nav2 status).
         nav_result = self._navigator.getResult()
@@ -426,6 +626,7 @@ class TrialRunner:
         dy = goal_pose["y"] - rec.robot_y
         result.goal_distance_remaining = math.hypot(dx, dy)
         result.min_obstacle_distance = rec.min_scan_overall
+        result.min_map_obstacle_distance = rec.min_map_overall
 
         # 7. Persist the full time-series JSON.
         self._finalize_json(rec, result, params, global_path=global_path_data)
@@ -439,65 +640,139 @@ class TrialRunner:
 
     def shutdown(self):
         try:
+            self._executor.shutdown()
             self._recorder.destroy_node()
         finally:
             if rclpy.ok():
                 rclpy.shutdown()
 
     # ── navigation recording loop ──
+    # def _record_navigation(self, rec: TrialRunnerNode, checker, collision_distance: float,
+    #                        result: TrialResult):
+    #     t_start = time.time()
+    #     last_record = t_start
+    #     prev_pose = [rec.robot_x, rec.robot_y]
+    #     local_len = 0.0
+
+    #     while not self._navigator.isTaskComplete():
+    #         rclpy.spin_once(rec, timeout_sec=0.05)
+    #         now = time.time()
+    #         elapsed = now - t_start
+
+    #         footprint_cost = 0.0
+    #         if checker is not None:
+    #             footprint_cost = checker.footprintCostAtPose(
+    #                 rec.robot_x, rec.robot_y, rec.robot_yaw)
+
+    #         # Record at the target rate (not every loop iteration).
+    #         if now - last_record >= self.record_period:
+    #             rec.record_sample(footprint_cost)
+    #             last_record = now
+    #             local_len += math.hypot(rec.robot_x - prev_pose[0], rec.robot_y - prev_pose[1])
+    #             prev_pose = [rec.robot_x, rec.robot_y]
+
+    #         # Collision: footprint in lethal cell AND LiDAR confirms proximity.
+    #         # (Fallback to LiDAR-only when no checker/costmap is available.)
+    #         # hit = False
+    #         # if checker is not None:
+    #         #     hit = (footprint_cost >= INSCRIBED_INFLATED_OBSTACLE
+    #         #            and rec.min_scan_value is not None
+    #         #            and rec.min_scan_value < collision_distance)
+    #         # elif rec.min_scan_value is not None:
+    #         #     hit = rec.min_scan_value < self.collision_threshold
+    #         if self._recorder.is_collided:
+    #             rec.record_sample(footprint_cost)
+    #             self._navigator.cancelTask()
+    #             result.collision = True
+    #             logger.warning(
+    #                 f"  COLLISION: footprint_cost={footprint_cost:.0f}, "
+    #                 f"min_scan={rec.min_scan_value:.3f}m < {collision_distance:.3f}m")
+    #             break
+
+    #         # Timeout guard.
+    #         if elapsed > self.timeout_sec:
+    #             self._navigator.cancelTask()
+    #             result.status = "TIMEOUT"
+    #             logger.warning(f"  Trial timed out after {elapsed:.1f}s")
+    #             break
+
+    #     result.travel_time_sec = time.time() - t_start
+    #     result.path_length_m = local_len
+    #     result.num_controller_samples = len(rec.controller_path)
+    #     result.num_risk_samples = len(rec.risk_state_history)
+    
     def _record_navigation(self, rec: TrialRunnerNode, checker, collision_distance: float,
-                           result: TrialResult):
+                           result: TrialResult, footprint_checker=None, costmap=None):
+        rec._recording = True
         t_start = time.time()
+        result.t_nav_start = t_start
         last_record = t_start
         prev_pose = [rec.robot_x, rec.robot_y]
         local_len = 0.0
+        self._pending_replans = []
 
         while not self._navigator.isTaskComplete():
-            rclpy.spin_once(rec, timeout_sec=0.05)
+            time.sleep(0.01)
             now = time.time()
             elapsed = now - t_start
+
+            # Drain /plan messages produced by the BT's RateController.
+            # Buffer only — analysis is deferred until after navigation ends,
+            # so ~270 footprintCostAtPose calls per replan never block this loop.
+            while rec.replan_events:
+                self._pending_replans.append(rec.replan_events.popleft())
 
             footprint_cost = 0.0
             if checker is not None:
                 footprint_cost = checker.footprintCostAtPose(
                     rec.robot_x, rec.robot_y, rec.robot_yaw)
 
-            # Record at the target rate (not every loop iteration).
             if now - last_record >= self.record_period:
                 rec.record_sample(footprint_cost)
                 last_record = now
                 local_len += math.hypot(rec.robot_x - prev_pose[0], rec.robot_y - prev_pose[1])
                 prev_pose = [rec.robot_x, rec.robot_y]
 
-            # Collision: footprint in lethal cell AND LiDAR confirms proximity.
-            # (Fallback to LiDAR-only when no checker/costmap is available.)
-            # hit = False
-            # if checker is not None:
-            #     hit = (footprint_cost >= INSCRIBED_INFLATED_OBSTACLE
-            #            and rec.min_scan_value is not None
-            #            and rec.min_scan_value < collision_distance)
-            # elif rec.min_scan_value is not None:
-            #     hit = rec.min_scan_value < self.collision_threshold
+            # Ground-truth collision from Gazebo physics contacts (gazebo_collision_monitor
+            # plugin -> /gazebo/collision -> _collision_callback sets is_collided).
+            # NOT costmap-based: inflation_radius is a treatment, so costmap cost would be
+            # an endogenous outcome label.
             if self._recorder.is_collided:
                 rec.record_sample(footprint_cost)
                 self._navigator.cancelTask()
                 result.collision = True
-                logger.warning(
-                    f"  COLLISION: footprint_cost={footprint_cost:.0f}, "
-                    f"min_scan={rec.min_scan_value:.3f}m < {collision_distance:.3f}m")
+                logger.warning("  COLLISION detected by Gazebo plugin (/gazebo/collision)")
                 break
 
-            # Timeout guard.
             if elapsed > self.timeout_sec:
                 self._navigator.cancelTask()
                 result.status = "TIMEOUT"
                 logger.warning(f"  Trial timed out after {elapsed:.1f}s")
                 break
 
-        result.travel_time_sec = time.time() - t_start
+        rec._recording = False
+        result.t_nav_end = time.time()
+        result.travel_time_sec = result.t_nav_end - t_start
         result.path_length_m = local_len
         result.num_controller_samples = len(rec.controller_path)
         result.num_risk_samples = len(rec.risk_state_history)
+        result.collision_links = [
+            {"t": entry["t"] - t_start, "info": entry["info"]}
+            for entry in rec.collision_links
+        ]
+
+        # Navigation is over; now it is safe to do the expensive costmap math.
+        # Drain anything that arrived between the last loop iteration and task
+        # completion, then analyze every buffered plan exactly once.
+        while rec.replan_events:
+            self._pending_replans.append(rec.replan_events.popleft())
+
+        replan_analyses = [
+            self._analyze_replan(ev, footprint_checker, costmap)
+            for ev in self._pending_replans
+        ]
+        result.num_replans = len(replan_analyses)
+        result.replan_history = replan_analyses
 
     # ── helpers ──
     def _make_pose_stamped(self, pose: dict) -> PoseStamped:
@@ -551,11 +826,14 @@ class TrialRunner:
 
 
     def _wait_for_localization(self):
-        """Give AMCL time to converge after the initial pose is set."""
+        """Give AMCL time to converge after the initial pose is set.
+
+        The recorder node is spun by the background executor, so this must NOT
+        call rclpy.spin_once(self._recorder, ...) — a node may belong to only
+        one executor. Just wait; callbacks are being serviced on the other thread.
+        """
         logger.info("  Waiting for localization to converge...")
-        deadline = time.time() + self.localization_settle_sec
-        while time.time() < deadline:
-            rclpy.spin_once(self._recorder, timeout_sec=0.05)
+        time.sleep(self.localization_settle_sec)
         logger.info(f"  Localization ready (waited {self.localization_settle_sec:.0f}s)")
 
     def _resolve_footprint(self, params: dict) -> list:
@@ -580,12 +858,36 @@ class TrialRunner:
         return [[0.27, 0.0], [0.19, 0.19], [0.0, 0.27], [-0.19, 0.19],
                 [-0.27, 0.0], [-0.19, -0.19], [0.0, -0.27], [0.19, -0.19]]
 
+    def _get_static_obstacles(self) -> Optional[np.ndarray]:
+        """Occupied cells of the static map (map frame), loaded once and cached.
+
+        Returns None if no map_yaml_path is configured or the map cannot be
+        read — the pose-based footprint clearance then simply stays disabled.
+        """
+        if self._static_obstacles_loaded:
+            return self._static_obstacles
+        self._static_obstacles_loaded = True
+        if not self.map_yaml_path or not os.path.exists(self.map_yaml_path):
+            logger.warning("  No static map available; map-based clearance disabled.")
+            return None
+        try:
+            obstacles, res = _static_map_obstacles(self.map_yaml_path)
+            logger.info(f"  Static map: {len(obstacles)} occupied cells "
+                        f"@ {res:.3f} m/cell for footprint clearance.")
+            self._static_obstacles = obstacles
+        except Exception as e:
+            logger.warning(f"  Could not load static map obstacles: {e}")
+            self._static_obstacles = None
+        return self._static_obstacles
+
     def _build_footprint_checker(self, footprint: list):
         """Fetch the current global costmap and build a checker for `footprint`.
         Returns (checker, costmap_response) — both None if unavailable."""
         if not _HAVE_FOOTPRINT_CHECKER:
             return None, None
-        costmap = self._get_costmap()
+        # Wait for the costmap to repopulate after clearAllCostmaps(); otherwise
+        # we snapshot an all-unknown (255) grid and every footprint cost is 255.
+        costmap = self._get_costmap(wait_until_populated=True)
         if costmap is None:
             logger.warning("  Could not fetch global costmap; footprint cost disabled.")
             return None, None
@@ -598,12 +900,45 @@ class TrialRunner:
             f"circumscribed={g.circumscribed_radius:.3f}m")
         return checker, costmap
 
-    def _get_costmap(self):
+    def _get_costmap(self, wait_until_populated: bool = False, timeout_sec: float = 5.0):
+        """Fetch the current global costmap via the GetCostmap service.
+
+        When wait_until_populated is True, keep re-fetching until the costmap has
+        repopulated with real information. This matters right after
+        clearAllCostmaps(): the clear resets every cell to NO_INFORMATION (255)
+        and the static + obstacle layers only restamp on the next update cycle.
+        Snapshotting during that window yields an all-255 grid, which makes every
+        footprintCostAtPose read 255 (and every min-obstacle distance read 0)."""
         if not self._costmap_cli.wait_for_service(timeout_sec=5.0):
             return None
-        future = self._costmap_cli.call_async(GetCostmap.Request())
-        rclpy.spin_until_future_complete(self._navigator, future, timeout_sec=10.0)
-        return future.result()
+        deadline = time.time() + timeout_sec
+        while True:
+            future = self._costmap_cli.call_async(GetCostmap.Request())
+            rclpy.spin_until_future_complete(self._navigator, future, timeout_sec=10.0)
+            cm = future.result()
+            if cm is None or not wait_until_populated:
+                return cm
+            data = np.asarray(cm.map.data, dtype=np.uint8)
+            # Populated once any cell carries information other than "unknown" (255).
+            if data.size and np.any(data != 255):
+                return cm
+            if time.time() >= deadline:
+                logger.warning(
+                    f"  Global costmap still all-unknown {timeout_sec:.1f}s after "
+                    "clear; footprint costs may be unreliable.")
+                return cm
+            time.sleep(0.2)
+
+    def _analyze_replan(self, ev: dict, checker, costmap) -> dict:
+        """Analyze one buffered /plan message. Called AFTER navigation ends."""
+        path_msg = ev["path_msg"]
+        _, path_len, min_dist = self._analyze_global_path(path_msg, checker, costmap)
+        return {
+            "timestamp": ev["timestamp"],
+            "path_length_m": path_len,
+            "min_obstacle_distance": min_dist,
+            "num_poses": len(path_msg.poses),
+        }
 
     def _analyze_global_path(self, path, checker, costmap):
         """Return (per-pose list, total length, min obstacle distance)."""
@@ -683,16 +1018,20 @@ class TrialRunner:
             "local_path_length": result.path_length_m,
             "min_global_dist_to_obstacle": result.min_global_obstacle_distance,
             "min_obstacle_distance": result.min_obstacle_distance,
+            "min_map_dist_to_obstacle": result.min_map_obstacle_distance,
             "goal_distance_remaining": result.goal_distance_remaining,
             "initial_pose": {"x": result.start_x, "y": result.start_y, "yaw": result.start_yaw},
             "goal_pose": {"x": result.goal_x, "y": result.goal_y, "yaw": result.goal_yaw},
             "nav2_config": result.params,
             "path_global_planner": global_path,
             "path_with_controller": rec.controller_path,
-            "risk_state_history": [asdict(r) for r in rec.risk_state_history],
+            "risk_state_history": [asdict(r) for r in rec.risk_state_history if result.t_nav_start<=r.timestamp<=result.t_nav_end],
             "num_risk_samples": len(rec.risk_state_history),
             "num_controller_samples": len(rec.controller_path),
             "map_yaml": self.map_yaml_path,
+            "num__global_replans": result.num_replans,
+            "global_replan_history": result.replan_history,
+            "collision_links": result.collision_links,
         }
         path = os.path.join(self.output_dir, "trials", f"trial_{result.trial_id:05d}.json")
         with open(path, "w") as f:
@@ -740,5 +1079,3 @@ class TrialRunner:
             plt.close()
         except Exception as e:
             logger.debug(f"  Plot failed: {e}")
-
-

@@ -32,6 +32,8 @@ from typing import Optional
 import numpy as np
 import yaml
 
+from ament_index_python.packages import get_package_share_directory
+
 from rct_collector.scripts.param_space import ParameterSpace, ARM_CONFIGS, ARM_JOINT_NAMES
 from rct_collector.scripts.pose_sampler import PoseSampler
 from rct_collector.trial_runner import TrialRunner, TrialResult
@@ -124,7 +126,7 @@ class RCTOrchestrator:
         self.pose_sampler.load_map()
 
         self._load_presampled()
-
+        bt_path = os.path.join(get_package_share_directory('rct_collector'), 'behavior_trees', 'navigate_w_replanning_only.xml')
         self.trial_runner = TrialRunner(
             timeout_sec=self.config.trial_timeout_sec,
             collision_threshold=self.config.collision_threshold,
@@ -134,6 +136,7 @@ class RCTOrchestrator:
             gazebo_robot_model=self.config.gazebo_robot_model,
             output_dir=self.config.output_dir,
             map_yaml_path=self.config.map_yaml_path,
+            bt_xml_path=bt_path,
         )
 
         self._verify_nav2_running()

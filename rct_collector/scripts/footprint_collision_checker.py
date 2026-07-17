@@ -1,7 +1,7 @@
 #! /usr/bin/env python3
 # Copyright 2021 Samsung Research America
 # Copyright 2022 Afif Swaidan
-# Copyright 2025 Forough - Enhanced with geometry computation and collision detection
+# Copyright 2025 Forough Zamani- Enhanced with geometry computation and collision detection
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -407,6 +407,14 @@ class FootprintCollisionChecker:
         """
         line_cost = 0.0
         point_cost = -1.0
+
+        # Degenerate segment: adjacent footprint vertices can truncate into the
+        # same integer costmap cell when their separation is <= ~1 cell
+        # (resolution). LineIterator rejects zero-length lines, so evaluate the
+        # single cell directly instead.
+        if int(x0) == int(x1) and int(y0) == int(y1):
+            return float(self.pointCost(int(x0), int(y0)))
+
         line_iterator = LineIterator(x0, y0, x1, y1, step_size)
 
         while line_iterator.isValid():
