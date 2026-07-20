@@ -11,9 +11,9 @@ repositories:
     type: git
     url: https://github.com/pal-robotics/pal_gazebo_worlds.git
     version: humble-devel
-  tiago_navigation:
+  pmb2_navigation:
     type: git
-    url: https://github.com/pal-robotics/tiago_navigation.git
+    url: https://github.com/pal-robotics/pmb2_navigation.git
     version: humble-devel
   rct_collector:
     type: git
