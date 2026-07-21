@@ -227,6 +227,8 @@ class TrialResult:
     path_length_m: float = 0.0                       # controller (executed) path
     global_path_length_m: float = 0.0               # planned global path
     goal_distance_remaining: float = 0.0
+    final_xy_error: float = 0.0
+    final_yaw_error: float = 0.0
     min_obstacle_distance: float = float("inf")     # closest LiDAR approach (base_link → obstacle)
     min_map_obstacle_distance: float = float("inf")  # closest static-map approach (base_link → obstacle)
     min_global_obstacle_distance: float = float("inf")  # along the planned path
@@ -256,6 +258,8 @@ class TrialResult:
             "path_length_m": self.path_length_m,
             "global_path_length_m": self.global_path_length_m,
             "goal_distance_remaining": self.goal_distance_remaining,
+            "final_xy_error": self.final_xy_error,
+            "final_yaw_error": self.final_yaw_error,
             "min_obstacle_distance": self.min_obstacle_distance,
             "min_map_obstacle_distance": self.min_map_obstacle_distance,
             "min_global_obstacle_distance": self.min_global_obstacle_distance,
@@ -472,7 +476,7 @@ class TrialRunner:
 
     def __init__(
         self,
-        timeout_sec: float = 180.0,
+        timeout_sec: float = 150.0,
         collision_threshold: float = 0.15,
         collect_risk_features: bool = False,
         scan_topic: str = "/scan_raw", #scan
@@ -621,10 +625,22 @@ class TrialRunner:
         else:
             result.status = result.status or "UNKNOWN"
 
-        # 6. Goal distance remaining + executed path length.
-        dx = goal_pose["x"] - rec.robot_x
-        dy = goal_pose["y"] - rec.robot_y
-        result.goal_distance_remaining = math.hypot(dx, dy)
+        # 6. Goal distance remaining, final xy error, and final yaw error based on
+        # the last pose of the controller path.
+        if rec.controller_path:
+            last_pose = rec.controller_path[-1]["pose"]
+            last_x, last_y, last_yaw = last_pose[0], last_pose[1], last_pose[2]
+        else:
+            last_x, last_y, last_yaw = rec.robot_x, rec.robot_y, rec.robot_yaw
+
+        dx = goal_pose["x"] - last_x
+        dy = goal_pose["y"] - last_y
+        result.final_xy_error = float(math.hypot(dx, dy))
+        result.goal_distance_remaining = result.final_xy_error
+
+        dyaw = goal_pose["yaw"] - last_yaw
+        result.final_yaw_error = float(math.atan2(math.sin(dyaw), math.cos(dyaw)))
+
         result.min_obstacle_distance = rec.min_scan_overall
         result.min_map_obstacle_distance = rec.min_map_overall
 
@@ -1020,6 +1036,8 @@ class TrialRunner:
             "min_obstacle_distance": result.min_obstacle_distance,
             "min_map_dist_to_obstacle": result.min_map_obstacle_distance,
             "goal_distance_remaining": result.goal_distance_remaining,
+            "final_xy_error": result.final_xy_error,
+            "final_yaw_error": result.final_yaw_error,
             "initial_pose": {"x": result.start_x, "y": result.start_y, "yaw": result.start_yaw},
             "goal_pose": {"x": result.goal_x, "y": result.goal_y, "yaw": result.goal_yaw},
             "nav2_config": result.params,

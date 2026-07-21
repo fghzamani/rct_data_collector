@@ -7,13 +7,8 @@ This repository is a ros2 package for collecting randomized controlled trials in
 To run a single test trial, run the following command:
 
 ```bash
-ros2 run rct_collector rct_collect \
-  --map /opt/pal/alum/share/pal_maps/maps/pal_office/map.yaml \
-  --trials 1 \
-  --output /home/user/exchange/tiago_wr/rct_data_smoke \
-  --presampled-poses /home/user/exchange/tiago_wr/src/rct_collector/rct_data/presampled_poses.json \
-  --move-arm --collect-risk \
-  --timeout 180 --log-level DEBUG
+ros2 run rct_collector rct_collect   --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml   --trials 1   --output /home/forough/phd_projects/online_tuner/rct_data_smoke   --presampled-poses /home/forough/phd_projects/online_tuner/src/rct_data_collector/rct_data/presampled_poses.json   --move-arm --collect-risk   --timeout 180 --log-level DEBUG
+
 ```
 
 ## Required Gazebo plugins for custom worlds
@@ -67,3 +62,7 @@ If you use your own world file, add **both** plugins as direct children of `<wor
    ros2 service list | grep set_entity_state     # plugin 1
    ros2 topic echo /gazebo/collision --once       # plugin 2
    ```
+
+  ###Remember
+  - xhost +local:root in your own system before runing the docker container to give acess to the GUI.
+  
