@@ -649,6 +649,7 @@ class TrialRunner:
         # across trials); (b) the goal may have latched SUCCEEDED just before the
         # async cancel landed, since a terminal goal cannot be un-terminated.
         # Either way it previously overwrote "TIMEOUT" with "SUCCESS".
+        
         nav_result = self._navigator.getResult()
         if result.collision:
             result.status = "COLLISION"

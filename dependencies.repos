@@ -13,8 +13,8 @@ repositories:
     version: humble-devel
   pmb2_navigation:
     type: git
-    url: https://github.com/pal-robotics/pmb2_navigation.git
-    version: humble-devel
+    url: https://github.com/fghzamani/pmb2_navigation.git
+    version: fgh-rct-config
   rct_collector:
     type: git
     url: https://github.com/fghzamani/rct_data_collector
