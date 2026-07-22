@@ -247,6 +247,15 @@ class TrialResult:
     replan_history: list = field(default_factory=list)   # not written to CSV, only JSON
     collision_links: list = field(default_factory=list)  # not written to CSV, only JSON
 
+    # True when THIS runner decided the terminal status (early in-tolerance
+    # SUCCESS, or TIMEOUT) rather than Nav2's action result. When set, the
+    # status resolution in run_trial() must NOT consult getResult(): after a
+    # cancelTask() the BasicNavigator's cached status can be stale (it is only
+    # written inside isTaskComplete(), which never returns True on these paths)
+    # or can report SUCCEEDED from a goal that latched success just before the
+    # cancel landed. Either way it would silently overwrite our status.
+    terminated_by_runner: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         """Flat, single-level dict for CSV output."""
         d = {
@@ -488,9 +497,19 @@ class TrialRunner:
         collision_margin: float = 0.05,
         localization_settle_sec: float = 3.0,
         save_per_trial_json: bool = True,
-        generate_plots: bool = False,
+        generate_plots: bool = True,
         risk_topic: str = "/risk_state",
-        bt_xml_path: str = ""
+        bt_xml_path: str = "",
+        # Goal tolerances used for the runner's own early-stop check. These MUST
+        # be kept equal to the goal_checker values in your controller_server
+        # params, otherwise the runner and Nav2 can disagree about "arrived".
+        xy_goal_tolerance: float = 0.25,
+        yaw_goal_tolerance: float = 0.25,
+        stop_when_within_tolerance: bool = True,
+        # Ignore tolerance hits before this many seconds, so a trial whose start
+        # pose already sits inside the goal tolerance is not declared an instant
+        # success before the controller has done anything.
+        min_trial_time_sec: float = 2.0,
     ):
         self.timeout_sec = timeout_sec
         self.collision_threshold = collision_threshold
@@ -507,6 +526,10 @@ class TrialRunner:
         self.generate_plots = generate_plots
         self.risk_topic = risk_topic
         self.bt_xml_path = bt_xml_path
+        self.xy_goal_tolerance = xy_goal_tolerance
+        self.yaw_goal_tolerance = yaw_goal_tolerance
+        self.stop_when_within_tolerance = stop_when_within_tolerance
+        self.min_trial_time_sec = min_trial_time_sec
 
         if not rclpy.ok():
             rclpy.init()
@@ -612,14 +635,35 @@ class TrialRunner:
         self._navigator.goToPose(goal_stamped, behavior_tree=self.bt_xml_path)
         self._record_navigation(rec, checker, collision_distance, result, checker, costmap)
 
-        # 5. Classify outcome (collision overrides the Nav2 status).
+        # 5. Classify outcome.
+        #
+        # Precedence: collision > runner decision > Nav2 action result.
+        #
+        # getResult() is consulted ONLY when the recording loop exited because
+        # Nav2 finished the task on its own (isTaskComplete() went True). On the
+        # runner-terminated paths (early in-tolerance SUCCESS, TIMEOUT) we called
+        # cancelTask() and broke out, and getResult() is then unreliable in two
+        # ways: (a) BasicNavigator only writes self.status inside
+        # isTaskComplete(), which never returned True on those paths, so the
+        # value can be left over from a PREVIOUS trial (the navigator is reused
+        # across trials); (b) the goal may have latched SUCCEEDED just before the
+        # async cancel landed, since a terminal goal cannot be un-terminated.
+        # Either way it previously overwrote "TIMEOUT" with "SUCCESS".
         nav_result = self._navigator.getResult()
         if result.collision:
             result.status = "COLLISION"
+        elif result.terminated_by_runner:
+            # Authoritative — already set at the break site. Log the discrepancy
+            # so a disagreement with Nav2 stays visible instead of silent.
+            if nav_result == TaskResult.SUCCEEDED and result.status != "SUCCESS":
+                logger.warning(
+                    f"  Nav2 reported SUCCEEDED but the runner terminated this "
+                    f"trial as {result.status}; keeping {result.status}. "
+                    "(Stale/raced BasicNavigator status.)")
         elif nav_result == TaskResult.SUCCEEDED:
             result.status = "SUCCESS"
         elif nav_result == TaskResult.CANCELED:
-            result.status = result.status if result.status == "TIMEOUT" else "CANCELED"
+            result.status = "CANCELED"
         elif nav_result == TaskResult.FAILED:
             result.status = "FAILED"
         else:
@@ -749,6 +793,32 @@ class TrialRunner:
                 local_len += math.hypot(rec.robot_x - prev_pose[0], rec.robot_y - prev_pose[1])
                 prev_pose = [rec.robot_x, rec.robot_y]
 
+            # Early termination: the robot is inside the goal tolerance.
+            # Requires xy AND yaw to be satisfied at the SAME pose, so the
+            # controller cannot loiter doing repeated heading corrections near
+            # the goal (the behaviour that was tripping the timeout). Measured
+            # from rec.robot_* — the same /amcl_pose source used for the final
+            # error below — so a SUCCESS declared here always has final error
+            # within tolerance.
+            if self.stop_when_within_tolerance and elapsed >= self.min_trial_time_sec:
+                _dx = result.goal_x - rec.robot_x
+                _dy = result.goal_y - rec.robot_y
+                _xy_err = math.hypot(_dx, _dy)
+                _dyaw = result.goal_yaw - rec.robot_yaw
+                _yaw_err = abs(math.atan2(math.sin(_dyaw), math.cos(_dyaw)))
+                if (_xy_err <= self.xy_goal_tolerance
+                        and _yaw_err <= self.yaw_goal_tolerance):
+                    rec.record_sample(footprint_cost)
+                    self._navigator.cancelTask()
+                    result.status = "SUCCESS"
+                    result.terminated_by_runner = True
+                    logger.info(
+                        f"  Within goal tolerance (xy={_xy_err:.3f}m <= "
+                        f"{self.xy_goal_tolerance:.3f}, yaw={_yaw_err:.3f}rad <= "
+                        f"{self.yaw_goal_tolerance:.3f}) after {elapsed:.1f}s — "
+                        "ending trial.")
+                    break
+
             # Ground-truth collision from Gazebo physics contacts (gazebo_collision_monitor
             # plugin -> /gazebo/collision -> _collision_callback sets is_collided).
             # NOT costmap-based: inflation_radius is a treatment, so costmap cost would be
@@ -763,6 +833,7 @@ class TrialRunner:
             if elapsed > self.timeout_sec:
                 self._navigator.cancelTask()
                 result.status = "TIMEOUT"
+                result.terminated_by_runner = True
                 logger.warning(f"  Trial timed out after {elapsed:.1f}s")
                 break
 
@@ -1028,6 +1099,7 @@ class TrialRunner:
         payload = {
             "trial_id": result.trial_id,
             "status": result.status,
+            "terminated_by_runner": result.terminated_by_runner,
             "is_collided": result.collision,
             "travel_time_sec": result.travel_time_sec,
             "global_path_length": result.global_path_length_m,
