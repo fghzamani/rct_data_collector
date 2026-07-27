@@ -7,7 +7,7 @@ This repository is a ros2 package for collecting randomized controlled trials in
 To run a single test trial, run the following command:
 
 ```bash
-ros2 run rct_collector rct_collect   --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml   --trials 1   --output /home/forough/phd_projects/online_tuner/rct_data_smoke   --presampled-poses /home/forough/phd_projects/online_tuner/src/rct_data_collector/rct_data/presampled_poses.json   --move-arm --collect-risk   --timeout 180 --log-level DEBUG
+ros2 run rct_collector rct_collect   --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml   --trials 20   --output /home/forough/phd_projects/online_tuner/rct_data_smoke   --presampled-poses /home/forough/phd_projects/online_tuner/src/rct_data_collector/rct_data/presampled_poses.json   --move-arm --collect-risk   --timeout 150 --log-level DEBUG --seed 42
 
 ```
 
@@ -42,6 +42,11 @@ If you use your own world file, add **both** plugins as direct children of `<wor
 </world>
 ```
 
+## generate presampled poses randomly
+python3 main.py --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml --visualize     --presampled-poses /home/forough/phd_projects/online_tuner/src/rct_data_collector/rct_data/presampled_poses.json --generate-poses 100 
+
+
+
 ### Setup
 
 1. Build and source the collision-monitor package (Gazebo must be launched from this sourced shell, or the `.so` won't be found):
@@ -65,4 +70,18 @@ If you use your own world file, add **both** plugins as direct children of `<wor
 
   ###Remember
   - xhost +local:root in your own system before runing the docker container to give acess to the GUI.
+
+
+| `failure_reason` | Detected by | Answers |
+|---|---|---|
+| `PLANNING_FAILED_INITIAL` | pre-nav `getPath()` returned no path | goal unreachable from start |
+| `BT_PLANNER_FAILED` | `ComputePathToPose` → FAILURE on `/behavior_tree_log` | planner failed mid-run |
+| `BT_CONTROLLER_FAILED` | `FollowPath` → FAILURE on `/behavior_tree_log` | MPPI gave up |
+| `BT_OTHER_FAILED` | any other BT node → FAILURE | container/unknown node |
+| `STUCK_NO_PROGRESS` | stall detector in the recording loop | robot stopped moving |
+| `RUNNER_TIMEOUT` | `timeout_sec` in the recording loop | ran out of clock |
+| `COLLISION` | `/gazebo/collision` contact | physical hit |
+| `RUNNER_EXCEPTION` | orchestrator `_record_failure` | harness crashed |
+| `NONE` | no failure detected | trial ran to completion |
+| `UNKNOWN` | Nav2 said FAILED, BT log was silent | diagnostic gap |
   

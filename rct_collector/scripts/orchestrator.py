@@ -70,10 +70,76 @@ class OrchestratorConfig:
     collision_threshold: float = 0.15
 
     collect_risk_features: bool = False
+    risk_topic: str = "/risk_state"
 
     presampled_poses_path: Optional[str] = None
     presampled_configs_path: Optional[str] = None
     seed: Optional[int] = None
+
+    # --- Pre-generated pose/config handling -------------------------------
+    # How trial i picks its pose from the pre-sampled pool:
+    #   "index"    : pose[i] (the old behaviour). Pose is then a deterministic
+    #                function of trial order, i.e. perfectly confounded with
+    #                time — anything that drifts over the run (thermal, memory,
+    #                map/localization state) is aliased onto the pose factor.
+    #   "shuffled" : a seeded permutation of the pool, reshuffled each time the
+    #                pool is exhausted. Pose stays balanced but is no longer
+    #                collinear with trial index. RECOMMENDED.
+    pose_assignment: str = "shuffled"
+    # If the pool is smaller than num_trials: reuse it (True, cycling through
+    # fresh permutations) or abort (False). The old code silently *clamped
+    # num_trials to the pool size*, so `num_trials: 3000` with a 20-pose file
+    # quietly produced 20 trials.
+    allow_pose_reuse: bool = True
+    allow_config_reuse: bool = False   # configs are the treatment: reuse must be deliberate
+
+    # --- Parameter application / verification -----------------------------
+    param_service_timeout_sec: float = 5.0
+    param_readback_attempts: int = 3      # retries before recording READBACK_FAILED
+    param_readback_backoff_sec: float = 0.25
+    param_settle_sec: float = 0.0         # pause after set, before read-back
+    # Abort the run if a trial's treatment could not be applied at all. Keeps a
+    # silent mis-specification from poisoning thousands of rows.
+    max_consecutive_integrity_failures: int = 5
+
+    # --- Goal tolerance (recorded per row so success is re-derivable) ------
+    xy_goal_tolerance: float = 0.35
+    yaw_goal_tolerance: float = 0.65
+    check_goal_tolerance_against_nav2: bool = True
+    # End a trial as soon as GROUND TRUTH enters the goal tolerance.
+    #
+    # Leave False for the dual-outcome design. Stopping here fires exactly on
+    # the trials where success_true == 1, so Nav2 never renders its own verdict
+    # on those trials and success_believed goes missing non-randomly — which
+    # destroys the true-vs-believed comparison in the one cell that matters.
+    # Arrival is still detected and timestamped either way
+    # (gt_ever_within_tolerance, t_first_within_tolerance).
+    stop_when_within_tolerance: bool = False
+
+    # --- LiDAR self-return filtering (see TrialRunner) ---------------------
+    scan_self_filter_radius_m: float = 0.30
+
+    # --- Ground-truth rate guard -------------------------------------------
+    # Startup check on /gazebo/model_states. gazebo_ros_state defaults to 1 Hz,
+    # which quantises path_length_m, final_xy_error and min_obstacle_distance.
+    # 0.0 disables the check.
+    gt_min_rate_hz: float = 20.0
+
+    # --- Stall detection ---------------------------------------------------
+    # End a trial as STUCK once the ground-truth pose has been static this long,
+    # rather than burning the full trial_timeout_sec on a robot that is not
+    # going to recover (this BT has no recovery nodes). 0.0 disables the
+    # termination; longest_stall_sec is still recorded either way.
+    no_progress_timeout_sec: float = 20.0
+    no_progress_dist_m: float = 0.10
+    no_progress_yaw_rad: float = 0.20
+
+    # Constants of the r_grad DEFINITION, forwarded to environment_risk_node so
+    # a single experiment YAML controls both processes. Deliberately NOT the
+    # inflation_radius / cost_scaling_factor treatment values.
+    risk_inflation_radius_m: float = 0.30
+    risk_cost_scaling_factor: float = 10.0
+    scan_angle_mask_deg: Optional[list] = None
 
     # Arm control (per-episode physical arm move to match the footprint variable)
     move_arm: bool = False
@@ -82,6 +148,11 @@ class OrchestratorConfig:
     play_motion_action: str = "/play_motion2"
     arm_move_time_sec: float = 4.0
     arm_move_on_change_only: bool = True  # only re-move the arm when the label changes
+    # Confirm the arm physically arrived by comparing /joint_states against the
+    # ARM_CONFIGS joint targets. An action reporting SUCCEEDED is not proof.
+    verify_arm_joints: bool = True
+    arm_joint_tolerance_rad: float = 0.15
+    arm_settle_sec: float = 1.0
 
 
 class RCTOrchestrator:
@@ -97,10 +168,22 @@ class RCTOrchestrator:
 
         self.completed_trials: int = 0
         self.consecutive_failures: int = 0
+        self.consecutive_integrity_failures: int = 0
         self.results: list[dict] = []
         self._shutdown_requested = False
-        self._last_param_failures: list[str] = []
+        self._last_param_outcomes: list = []          # list[ParamOutcome]
+        self._last_arm_status: dict = {}
         self._current_arm_label: Optional[str] = None  # last successfully applied arm pose
+
+        # Unique id for THIS process invocation. Every artifact written by this
+        # run is namespaced with it, so re-running trial N never overwrites the
+        # JSON/plot belonging to an earlier run of trial N.
+        self.run_id: str = datetime.now().strftime("%Y%m%dT%H%M%S")
+
+        self.param_applier = None
+        self._param_node = None
+        self._pose_index_map: Optional[list] = None
+        self._config_index_map: Optional[list] = None
 
         os.makedirs(self.config.output_dir, exist_ok=True)
         signal.signal(signal.SIGINT, self._handle_shutdown)
@@ -113,6 +196,18 @@ class RCTOrchestrator:
     def initialize(self):
         if not self.config.map_yaml_path:
             raise ValueError("map_yaml_path must be set")
+
+        # A null seed silently disables every reproducibility guarantee in this
+        # package: the assignment map records "seed": null, the pose/config
+        # permutations cannot be replayed, and configs fall back to per-trial
+        # uniform sampling instead of the maximin/LHS coverage the parameter
+        # space provides. The smoke run drifted to 14 tucked / 6 carry this way.
+        if self.config.seed is None:
+            raise ValueError(
+                "seed is None. The run would not be reproducible and the "
+                "assignment map could not be replayed. Set `seed:` in the "
+                "experiment config (any integer)."
+            )
 
         logger.info(f"Loading map from {self.config.map_yaml_path}")
         self.pose_sampler = PoseSampler(
@@ -131,15 +226,91 @@ class RCTOrchestrator:
             timeout_sec=self.config.trial_timeout_sec,
             collision_threshold=self.config.collision_threshold,
             collect_risk_features=self.config.collect_risk_features,
+            risk_topic=self.config.risk_topic,
             scan_topic=self.config.scan_topic,
             odom_topic=self.config.odom_topic,
             gazebo_robot_model=self.config.gazebo_robot_model,
             output_dir=self.config.output_dir,
             map_yaml_path=self.config.map_yaml_path,
             bt_xml_path=bt_path,
+            run_id=self.run_id,
+            xy_goal_tolerance=self.config.xy_goal_tolerance,
+            yaw_goal_tolerance=self.config.yaw_goal_tolerance,
+            stop_when_within_tolerance=self.config.stop_when_within_tolerance,
+            scan_self_filter_radius_m=self.config.scan_self_filter_radius_m,
+            scan_angle_mask_deg=self.config.scan_angle_mask_deg,
+            gt_min_rate_hz=self.config.gt_min_rate_hz,
+            no_progress_timeout_sec=self.config.no_progress_timeout_sec,
+            no_progress_dist_m=self.config.no_progress_dist_m,
+            no_progress_yaw_rad=self.config.no_progress_yaw_rad,
         )
 
+        # TrialRunner has now initialised rclpy; build the parameter client on
+        # a dedicated node. It is deliberately NOT added to the recorder's
+        # executor — ParamApplier spins it itself via spin_until_future_complete.
+        self._init_param_applier()
+
         self._verify_nav2_running()
+        if self.config.check_goal_tolerance_against_nav2:
+            self._verify_goal_tolerance()
+
+    def _init_param_applier(self):
+        import rclpy
+        from rclpy.node import Node
+
+        from rct_collector.scripts.param_applier import ParamApplier
+
+        if not rclpy.ok():
+            rclpy.init()
+        self._param_node = Node("rct_param_applier")
+        self.param_applier = ParamApplier(
+            self._param_node,
+            service_timeout_sec=self.config.param_service_timeout_sec,
+            readback_attempts=self.config.param_readback_attempts,
+            readback_backoff_sec=self.config.param_readback_backoff_sec,
+            settle_sec=self.config.param_settle_sec,
+        )
+        logger.info("Parameter applier ready (rclpy service clients) ✓")
+
+    def _verify_goal_tolerance(self):
+        """Warn loudly if the runner's success criterion disagrees with Nav2's.
+
+        The runner can end a trial early once it is 'within tolerance'. If that
+        threshold differs from the controller's goal_checker, the runner and
+        Nav2 disagree about what SUCCESS means and the outcome variable becomes
+        a mixture of two definitions.
+        """
+        if self.param_applier is None:
+            return
+        for name, ours in (("xy_goal_tolerance", self.config.xy_goal_tolerance),
+                           ("yaw_goal_tolerance", self.config.yaw_goal_tolerance)):
+            found = None
+            for path in (f"general_goal_checker.{name}", f"goal_checker.{name}", name):
+                val, _t, err = self.param_applier.get("controller_server", path,
+                                                      timeout_sec=3.0)
+                if err == "" and val is not None:
+                    found = (path, float(val))
+                    break
+            if found is None:
+                logger.warning(
+                    f"  Could not read Nav2's {name}; cannot confirm the runner's "
+                    f"success criterion matches the controller's."
+                )
+                continue
+            path, nav2_val = found
+            if abs(nav2_val - ours) > 1e-6:
+                raise RuntimeError(
+                    f"GOAL TOLERANCE MISMATCH: runner {name}={ours} but Nav2 "
+                    f"{path}={nav2_val}. SUCCESS would mean different things to "
+                    f"the runner and to Nav2, and the recorded tolerance columns "
+                    f"would not let anyone re-derive the outcome label. This was "
+                    f"only a warning during the smoke run (runner 0.25 vs Nav2 "
+                    f"0.45 for yaw) and every SUCCESS row was decided by a "
+                    f"threshold that is not in the CSV. Align the two in "
+                    f"nav2_params.yaml, or set check_goal_tolerance_against_nav2: "
+                    f"false to collect anyway."
+                )
+            logger.info(f"  {name} matches Nav2 ({nav2_val}) ✓")
 
     def _verify_nav2_running(self):
         logger.info("Checking Nav2 is running...")
@@ -165,8 +336,20 @@ class RCTOrchestrator:
             logger.warning("  Could not read /controller_server params")
 
     def _load_presampled(self):
-        """Load pre-generated configs/poses if paths were given, and clamp
-        num_trials to what's available so trial i always has a config[i]/pose[i]."""
+        """Load pre-generated configs/poses and build an explicit index map.
+
+        The old behaviour was to silently clamp ``num_trials`` down to the size
+        of the smallest pool, so a 20-entry pose file turned ``num_trials: 3000``
+        into a 20-trial run with only a warning in the log. It also used
+        ``pose[trial_id - 1]``, making the pose factor a deterministic function
+        of trial order and therefore collinear with anything that drifts over
+        the run.
+
+        Now: pools smaller than num_trials are either reused through fresh
+        seeded permutations (``allow_*_reuse: true``) or raise. Assignment is
+        shuffled by default so pose is balanced but not confounded with time.
+        The realised maps are written to disk for reproducibility.
+        """
         sources = [
             ("presampled_configs", self.config.presampled_configs_path,
              ParameterSpace.load_presampled, "pre-generated configs"),
@@ -179,16 +362,69 @@ class RCTOrchestrator:
                 setattr(self, attr, loaded)
                 logger.info(f"Loaded {len(loaded)} {label} from {path}")
 
-        avail = [len(x) for x in (self.presampled_configs, self.presampled_poses)
-                 if x is not None]
-        if avail:
-            limit = min(avail)
-            if self.config.num_trials > limit:
-                logger.warning(
-                    f"num_trials ({self.config.num_trials}) exceeds available "
-                    f"pre-generated entries ({limit}); clamping to {limit}."
-                )
-                self.config.num_trials = limit
+        rng = np.random.default_rng(self.config.seed)
+        n = self.config.num_trials
+
+        self._pose_index_map = self._build_index_map(
+            "poses", self.presampled_poses, n, self.config.allow_pose_reuse, rng)
+        self._config_index_map = self._build_index_map(
+            "configs", self.presampled_configs, n, self.config.allow_config_reuse, rng)
+
+        self._save_assignment_maps()
+
+    def _build_index_map(self, label: str, pool: Optional[list], n_trials: int,
+                         allow_reuse: bool, rng) -> Optional[list]:
+        """Map trial index -> pool index for the whole run."""
+        if pool is None:
+            return None
+        pool_n = len(pool)
+        if pool_n == 0:
+            raise ValueError(f"Pre-generated {label} pool is empty.")
+
+        if pool_n < n_trials and not allow_reuse:
+            raise ValueError(
+                f"num_trials ({n_trials}) exceeds the {pool_n} pre-generated "
+                f"{label} available, and reuse is disabled. Generate at least "
+                f"{n_trials} entries, or set allow_{label[:-1]}_reuse: true. "
+                f"(The previous behaviour silently shortened the run to "
+                f"{pool_n} trials.)"
+            )
+        if pool_n < n_trials:
+            logger.warning(
+                f"Only {pool_n} pre-generated {label} for {n_trials} trials; "
+                f"the pool will be reused ~{n_trials / pool_n:.1f}x. Each "
+                f"{label[:-1]} therefore appears as a repeated level — treat it "
+                f"as a blocking factor in the analysis, not as i.i.d. sampling."
+            )
+
+        if self.config.pose_assignment == "index":
+            return [i % pool_n for i in range(n_trials)]
+
+        # Shuffled: concatenate independent permutations of the pool until the
+        # run is covered. Guarantees near-equal usage of every entry while
+        # decorrelating entry identity from trial order.
+        out: list = []
+        while len(out) < n_trials:
+            out.extend(rng.permutation(pool_n).tolist())
+        return out[:n_trials]
+
+    def _save_assignment_maps(self):
+        """Persist the realised trial -> pool-entry assignment for reproducibility."""
+        path = os.path.join(self.config.output_dir,
+                            f"assignment_map_{self.run_id}.json")
+        try:
+            with open(path, "w") as f:
+                json.dump({
+                    "run_id": self.run_id,
+                    "seed": self.config.seed,
+                    "num_trials": self.config.num_trials,
+                    "pose_assignment": self.config.pose_assignment,
+                    "pose_index_map": self._pose_index_map,
+                    "config_index_map": self._config_index_map,
+                }, f)
+            logger.info(f"Assignment map written to {path}")
+        except OSError as e:
+            logger.warning(f"Could not write assignment map: {e}")
 
     def run(self):
         self._load_checkpoint()
@@ -208,6 +444,24 @@ class RCTOrchestrator:
                 result = self._run_single_trial(trial_id)
                 self._record_result(trial_id, result)
                 self.consecutive_failures = 0
+
+                # A run where the treatment repeatedly fails to reach the stack
+                # is producing rows whose recorded C_t is not the applied C_t.
+                # Better to stop than to fill a CSV with unusable trials.
+                broken = [o for o in self._last_param_outcomes if o.breaks_integrity]
+                if broken:
+                    self.consecutive_integrity_failures += 1
+                    if (self.consecutive_integrity_failures
+                            >= self.config.max_consecutive_integrity_failures):
+                        logger.critical(
+                            f"{self.consecutive_integrity_failures} consecutive trials "
+                            f"with an unapplied/mismatched treatment "
+                            f"({[o.key for o in broken]}). Stopping — fix the stack "
+                            f"before collecting further."
+                        )
+                        break
+                else:
+                    self.consecutive_integrity_failures = 0
             except Exception as e:
                 logger.error(f"Trial {trial_id} EXCEPTION: {e}", exc_info=True)
                 self.consecutive_failures += 1
@@ -223,15 +477,20 @@ class RCTOrchestrator:
                 time.sleep(self.config.cooldown_sec)
 
         self._save_final_results()
+        self.shutdown()
         logger.info(f"Done. {self.completed_trials} trials recorded.")
 
     def _run_single_trial(self, trial_id: int) -> TrialResult:
         idx = trial_id - 1  # trials are 1-indexed; lists are 0-indexed
+        self._last_pool_indices = {"config": None, "pose": None}
 
         # 1. Get this trial's config: pre-generated if available, else fresh
         if self.presampled_configs is not None:
-            params = self.presampled_configs[idx]
-            logger.info(f"  Config (presampled #{idx}): {self.param_space.flatten(params)}")
+            cfg_idx = (self._config_index_map[idx]
+                       if self._config_index_map is not None else idx)
+            self._last_pool_indices["config"] = cfg_idx
+            params = self.presampled_configs[cfg_idx]
+            logger.info(f"  Config (presampled #{cfg_idx}): {self.param_space.flatten(params)}")
         else:
             params = self.param_space.sample()
             logger.info(f"  Config (fresh): {self.param_space.flatten(params)}")
@@ -247,6 +506,14 @@ class RCTOrchestrator:
         # 1b. Move the physical arm — only when needed (first trial, label change,
         #     or after a failed/unknown move). When not relying on persistence,
         #     the arm is re-commanded every trial.
+        self._last_arm_status = {
+            "arm_requested_label": "",
+            "arm_move_attempted": 0,
+            "arm_move_skipped_persistent": 0,
+            "arm_verified": "",       # 1 / 0 / "" when not applicable
+            "arm_max_joint_error_rad": "",
+            "arm_detail": "",
+        }
         if self.config.move_arm:
             arm_pd = next(
                 (p for p in self.param_space.params
@@ -254,33 +521,42 @@ class RCTOrchestrator:
             )
             if arm_pd is not None:
                 label = params[arm_pd.node][arm_pd.name]
+                self._last_arm_status["arm_requested_label"] = label
                 if arm_persistence and label == self._current_arm_label:
                     logger.info(f"  Arm already in '{label}' — skipping move")
+                    self._last_arm_status["arm_move_skipped_persistent"] = 1
+                    # Persistence is an assumption, not an observation: confirm
+                    # the arm is still where we left it.
+                    self._confirm_arm_pose(label)
                 else:
+                    self._last_arm_status["arm_move_attempted"] = 1
                     if self._move_arm(label):
                         self._current_arm_label = label
                     else:
                         self._current_arm_label = None  # unknown -> force re-move next trial
-                        logger.warning(
-                            f"  Arm did not reach '{label}' — physical geometry may "
-                            f"not match the footprint for this trial."
-                        )
+                    self._confirm_arm_pose(label)
+
+                if self._last_arm_status["arm_verified"] == 0:
+                    logger.warning(
+                        f"  Arm did not reach '{label}' — physical geometry does "
+                        f"NOT match the footprint treatment for this trial. "
+                        f"Row will be flagged arm_verified=0."
+                    )
+                    self._current_arm_label = None
 
         # 2. Apply via dynamic reconfigure, with read-back verification
-        failed = self._apply_params(params)
-        self._last_param_failures = failed
-        if failed:
-            logger.warning(
-                f"  {len(failed)} param(s) did NOT verify (set rejected or read-back "
-                f"mismatch): {failed}. Trial will be flagged in the CSV."
-            )
-        else:
-            logger.info("  All params set and verified ✓")
+        outcomes = self._apply_params(params)
+        self._last_param_outcomes = outcomes
+        self._log_param_outcomes(outcomes)
 
         # 3. Get this trial's poses: pre-generated if available, else fresh
         if self.presampled_poses is not None:
-            entry = self.presampled_poses[idx]
+            pose_idx = (self._pose_index_map[idx]
+                        if self._pose_index_map is not None else idx)
+            self._last_pool_indices["pose"] = pose_idx
+            entry = self.presampled_poses[pose_idx]
             start_pose, goal_pose = entry["start"], entry["goal"]
+            logger.info(f"  Pose (presampled #{pose_idx})")
         else:
             start_pose, goal_pose = self.pose_sampler.sample_start_goal()
         logger.info(f"  Start: ({start_pose['x']:.2f}, {start_pose['y']:.2f})")
@@ -294,28 +570,37 @@ class RCTOrchestrator:
             params=params,
         )
 
-    def _apply_params(self, params: dict) -> list[str]:
-        """Set all params via `ros2 param set` and verify each via read-back.
+    def _apply_params(self, params: dict) -> list:
+        """Set every treatment parameter and classify how each one went.
 
-        A param is counted as failed if the `set` is rejected OR the
-        subsequent `get` does not return the value we asked for. This is what
-        protects RCT validity: a silently-rejected set would otherwise record
-        a do(C=x) trial in which C never actually changed, biasing that
-        parameter's causal coefficient.
+        Returns a list of ParamOutcome (one per ROS target, so a knob linked to
+        both costmaps via extra_targets yields two entries).
+
+        Why this matters for the RCT: the CSV records the value we *intended*
+        to apply. If a set is silently rejected, that row claims do(C=x) for a
+        trial in which C never changed, which biases that parameter's estimated
+        effect toward zero. The read-back is the manipulation check.
+
+        What changed from the original: verification now distinguishes "the node
+        refused / disagreed" (treatment integrity broken) from "the node
+        accepted but we failed to read it back" (a tooling hiccup, trial still
+        usable). Previously both wrote the same `params_unverified` flag, which
+        made 53% of the smoke run look invalid when in fact zero sets had been
+        rejected and zero values mismatched.
 
         Two special cases from the finalized space:
         - extra_targets: one sampled value applied to several ROS params (e.g.
           inflation radius / footprint on BOTH local and global costmaps), so it
           stays a single causal knob. Every target must verify.
-        - apply_via == "footprint": the sampled value is a label ("stowed" /
-          "extended") resolved to a concrete polygon preset before setting.
+        - apply_via == "footprint": the sampled value is a label ("tucked" /
+          "carry") resolved to a concrete polygon preset before setting.
 
         NOTE: read-back confirms the *parameter* changed. For inflation_radius
         and footprint it does NOT by itself prove the costmap *cost cache* /
         collision geometry was rebuilt — those are per-episode and verified
         behaviorally once (see README: inflation gradient).
         """
-        failed = []
+        outcomes = []
         for p in self.param_space.params:
             try:
                 value = params[p.node][p.name]
@@ -334,73 +619,89 @@ class RCTOrchestrator:
                 param_type = p.param_type
 
             for en, enm in [(ros_node, p.name)] + list(extra):
-                if not self._set_and_verify(en, enm, value, param_type):
-                    failed.append(f"{en}/{enm}")
-        return failed
+                out = self.param_applier.set_and_verify(en, enm, value, param_type)
+                # Remember which logical knob this ROS target belongs to, so the
+                # CSV can carry a param_actual__<knob> column.
+                out.logical_key = f"{p.node}__{p.name}"
+                outcomes.append(out)
+        return outcomes
 
-    def _set_and_verify(self, ros_node: str, name: str, value, param_type: str) -> bool:
-        """Set one param, then read it back and confirm it took."""
-        sv = ("true" if value else "false") if isinstance(value, bool) else str(value)
-        try:
-            r = subprocess.run(
-                ["ros2", "param", "set", f"/{ros_node}", name, sv],
-                capture_output=True, text=True, timeout=8,
+    def _log_param_outcomes(self, outcomes: list):
+        from rct_collector.scripts import param_applier as pa
+
+        bad = [o for o in outcomes if o.breaks_integrity]
+        soft = [o for o in outcomes if o.outcome == pa.READBACK_FAILED]
+
+        if bad:
+            logger.error(
+                f"  TREATMENT NOT APPLIED for {len(bad)} target(s): "
+                + "; ".join(f"{o.key} [{o.outcome}] {o.detail}" for o in bad)
+                + ". Row flagged treatment_valid=0 — exclude from causal estimates."
             )
-        except subprocess.TimeoutExpired:
-            logger.debug(f"  SET TIMEOUT /{ros_node} {name}")
-            return False
-        if r.returncode != 0:
-            logger.debug(f"  SET FAIL /{ros_node} {name}={sv}: {r.stderr.strip()}")
-            return False
-
-        got = self._get_param(ros_node, name)
-        if got is None:
-            logger.debug(f"  GET FAIL /{ros_node} {name} (could not read back)")
-            return False
-        if not self._values_match(got, value, param_type):
-            logger.debug(f"  MISMATCH /{ros_node} {name}: asked {value!r}, got {got!r}")
-            return False
-        return True
-
-    def _get_param(self, ros_node: str, name: str) -> Optional[str]:
-        """Read a param value, returning the raw value string or None."""
-        try:
-            r = subprocess.run(
-                ["ros2", "param", "get", f"/{ros_node}", name],
-                capture_output=True, text=True, timeout=8,
+        if soft:
+            logger.warning(
+                f"  {len(soft)} target(s) set OK but could not be read back after "
+                f"{self.config.param_readback_attempts} attempts: "
+                + "; ".join(o.key for o in soft)
+                + ". Treatment is most likely correct; row stays usable "
+                  "(treatment_valid=1, config_verified=0)."
             )
-        except subprocess.TimeoutExpired:
-            return None
-        if r.returncode != 0 or "value is:" not in r.stdout:
-            return None
-        return r.stdout.split("value is:", 1)[1].strip()
+        if not bad and not soft:
+            total_ms = 1000.0 * sum(o.elapsed_sec for o in outcomes)
+            logger.info(
+                f"  All {len(outcomes)} params set and verified ✓ ({total_ms:.0f} ms)")
 
-    @staticmethod
-    def _values_match(got_raw: str, target, param_type: str) -> bool:
-        """Compare a read-back value string against the target we set."""
-        try:
-            if param_type == "continuous":
-                tol = max(1e-3, 1e-2 * abs(float(target)))
-                return abs(float(got_raw) - float(target)) <= tol
-            if param_type == "discrete":
-                return int(float(got_raw)) == int(target)
-            if param_type == "footprint":
-                import ast
-                a = [[float(x) for x in pt] for pt in ast.literal_eval(str(got_raw))]
-                b = [[float(x) for x in pt] for pt in ast.literal_eval(str(target))]
-                if len(a) != len(b):
-                    return False
-                return all(
-                    abs(ai - bi) <= 1e-3
-                    for pa, pb in zip(a, b)
-                    for ai, bi in zip(pa, pb)
-                )
-            if param_type == "categorical":
-                return str(got_raw).strip() == str(target).strip()
-            # boolean
-            return str(got_raw).strip().lower() == str(target).strip().lower()
-        except (ValueError, TypeError, SyntaxError):
-            return False
+    def _confirm_arm_pose(self, label: str):
+        """Check /joint_states against the ARM_CONFIGS joint targets for `label`.
+
+        The footprint parameter is only a *proxy* for the physical arm pose. If
+        the arm never moved, the costmap says "carry" while the robot is still
+        tucked, and the trial silently measures the wrong treatment. The old
+        code logged a warning and moved on; nothing reached the CSV, so these
+        trials were indistinguishable from clean ones during analysis.
+
+        An action reporting SUCCEEDED is not sufficient evidence either, so the
+        joint positions themselves are compared. Fills self._last_arm_status.
+        """
+        st = self._last_arm_status
+        if not self.config.verify_arm_joints:
+            return
+
+        cfg = ARM_CONFIGS.get(label) or {}
+        target = cfg.get("joints")
+        if not target:
+            st["arm_detail"] = "no_joint_target_defined"
+            logger.warning(
+                f"  Arm config '{label}' has no joint targets; cannot verify the "
+                f"physical pose matches the footprint treatment."
+            )
+            return
+
+        if self.config.arm_settle_sec > 0:
+            time.sleep(self.config.arm_settle_sec)
+
+        actual = self.trial_runner.get_arm_joint_positions(ARM_JOINT_NAMES)
+        if actual is None:
+            st["arm_verified"] = 0
+            st["arm_detail"] = "no_joint_states"
+            logger.warning("  No /joint_states received; cannot verify arm pose.")
+            return
+
+        missing = [n for n in ARM_JOINT_NAMES if n not in actual]
+        if missing:
+            st["arm_verified"] = 0
+            st["arm_detail"] = f"missing_joints:{','.join(missing)}"
+            return
+
+        errs = [abs(actual[n] - float(t)) for n, t in zip(ARM_JOINT_NAMES, target)]
+        max_err = max(errs)
+        st["arm_max_joint_error_rad"] = round(max_err, 4)
+        st["arm_verified"] = int(max_err <= self.config.arm_joint_tolerance_rad)
+        if not st["arm_verified"]:
+            worst = ARM_JOINT_NAMES[int(np.argmax(errs))]
+            st["arm_detail"] = f"worst={worst}:{max_err:.3f}rad"
+        else:
+            logger.info(f"  Arm pose '{label}' verified ✓ (max err {max_err:.3f} rad)")
 
     def _move_arm(self, label: str) -> bool:
         """Move TIAGo's arm to the configuration for `label` and wait for it to
@@ -485,17 +786,87 @@ class RCTOrchestrator:
     # ── Recording ───────────────────────────────────────────────────────
 
     def _record_result(self, trial_id: int, result: TrialResult):
-        row = {"trial_id": trial_id, "timestamp": datetime.now().isoformat(), **result.to_dict()}
-        failures = self._last_param_failures
-        row["params_unverified_count"] = len(failures)
-        row["params_unverified"] = ";".join(failures)
-        row["config_valid"] = int(len(failures) == 0)
+        from rct_collector.scripts import param_applier as pa
+
+        row = {"run_id": self.run_id, "trial_id": trial_id,
+               "timestamp": datetime.now().isoformat(), **result.to_dict()}
+
+        # --- provenance: which pool entry produced this trial ---------------
+        pools = getattr(self, "_last_pool_indices", {}) or {}
+        row["config_pool_index"] = pools.get("config", "")
+        row["pose_pool_index"] = pools.get("pose", "")
+
+        # --- treatment fidelity --------------------------------------------
+        outcomes = self._last_param_outcomes
+        by_outcome: dict[str, list] = {}
+        for o in outcomes:
+            by_outcome.setdefault(o.outcome, []).append(o.key)
+
+        rejected = by_outcome.get(pa.SET_REJECTED, []) + by_outcome.get(pa.SET_TIMEOUT, [])
+        rejected += by_outcome.get(pa.NO_SERVICE, [])
+        mismatched = by_outcome.get(pa.MISMATCH, [])
+        readback_failed = by_outcome.get(pa.READBACK_FAILED, [])
+        not_ok = rejected + mismatched + readback_failed
+
+        row["params_rejected"] = ";".join(rejected)
+        row["params_rejected_count"] = len(rejected)
+        row["params_mismatched"] = ";".join(mismatched)
+        row["params_mismatched_count"] = len(mismatched)
+        row["params_readback_failed"] = ";".join(readback_failed)
+        row["params_readback_failed_count"] = len(readback_failed)
+
+        # Backwards-compatible names, but now meaning only "not fully confirmed".
+        row["params_unverified"] = ";".join(not_ok)
+        row["params_unverified_count"] = len(not_ok)
+
+        # config_verified : every target confirmed by read-back (strict).
+        # treatment_valid : nothing was rejected or read back wrong. This is the
+        #                   column to filter on for causal analysis — a failed
+        #                   read-back alone does not invalidate a trial.
+        row["config_verified"] = int(len(not_ok) == 0)
+        row["treatment_valid"] = int(len(rejected) == 0 and len(mismatched) == 0)
+        row["config_valid"] = row["treatment_valid"]   # legacy alias
+        row["param_apply_detail"] = ";".join(
+            f"{o.key}={o.outcome}" for o in outcomes if o.outcome != pa.OK)
+        row["param_apply_sec"] = round(sum(o.elapsed_sec for o in outcomes), 3)
+
+        # Read-back values alongside the intended ones, so a mismatch is
+        # recoverable in analysis instead of merely flagged.
+        for o in outcomes:
+            if o.actual is not None:
+                row[f"param_actual__{o.logical_key}"] = o.actual
+
+        # --- arm / footprint fidelity ---------------------------------------
+        row.update(self._last_arm_status or {})
+
+        # --- success criterion provenance ------------------------------------
+        # The three outcome columns (success_true, believed_within_tolerance,
+        # success_believed) are scored inside TrialResult._score_outcomes() and
+        # arrive via to_dict(); they are NOT recomputed here, so there is one
+        # definition of success in the codebase rather than two.
+        row["xy_goal_tolerance"] = self.config.xy_goal_tolerance
+        row["yaw_goal_tolerance"] = self.config.yaw_goal_tolerance
+        # Legacy alias kept so older analysis scripts keep working. Identical to
+        # success_true; prefer that name in new work.
+        row["within_goal_tolerance"] = (
+            "" if result.success_true is None else int(result.success_true))
+
+        if result.outcome_agreement == "FALSE_SUCCESS":
+            logger.warning(
+                f"  Trial {trial_id} scored FALSE_SUCCESS "
+                f"(true error {result.final_xy_error:.3f} m vs believed "
+                f"{result.believed_final_xy_error:.3f} m). Do NOT use "
+                "success_believed as the outcome for causal estimates.")
+
         self.results.append(row)
         self._append_csv(row)
 
     def _record_failure(self, trial_id: int, error_msg: str):
-        row = {"trial_id": trial_id, "timestamp": datetime.now().isoformat(),
-               "status": "EXCEPTION", "error": error_msg}
+        row = {"run_id": self.run_id, "trial_id": trial_id,
+               "timestamp": datetime.now().isoformat(),
+               "status": "EXCEPTION", "error": error_msg,
+               "failure_reason": "RUNNER_EXCEPTION",
+               "treatment_valid": 0, "config_valid": 0, "config_verified": 0}
         self.results.append(row)
         self._append_csv(row)
 
@@ -538,6 +909,8 @@ class RCTOrchestrator:
                 "completed_trials": self.completed_trials,
                 "timestamp": datetime.now().isoformat(),
                 "map": self.config.map_yaml_path,
+                "run_id": self.run_id,
+                "seed": self.config.seed,
             }, f, indent=2)
 
     def _load_checkpoint(self):
@@ -550,15 +923,120 @@ class RCTOrchestrator:
             logger.info("No checkpoint, starting fresh")
 
     def _save_final_results(self):
-        s = lambda status: sum(1 for r in self.results if r.get("status") == status)
+        """Recompute the summary from the CSV on disk, not from memory.
+
+        The old version counted statuses in ``self.results`` (only the rows this
+        process produced) while reporting ``total = self.completed_trials``
+        (which comes from the checkpoint and includes earlier sessions). On any
+        resumed run the two disagreed — the smoke output claimed total 10 with
+        statuses summing to 5, and COLLISION 0 while the CSV held 3.
+        """
+        csv_path = os.path.join(self.config.output_dir, self.config.results_csv)
+        rows: list[dict] = []
+        if os.path.exists(csv_path):
+            with open(csv_path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        def n(pred) -> int:
+            return sum(1 for r in rows if pred(r))
+
+        def truthy(r, key) -> bool:
+            return str(r.get(key, "")).strip() in ("1", "1.0", "True", "true")
+
+        def _flt(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        statuses = sorted({(r.get("status") or "UNKNOWN") for r in rows})
         summary = {
-            "total": self.completed_trials,
-            "SUCCESS": s("SUCCESS"), "COLLISION": s("COLLISION"),
-            "TIMEOUT": s("TIMEOUT"), "FAILED": s("FAILED"),
-            "CANCELED": s("CANCELED"), "PLANNING_FAILED": s("PLANNING_FAILED"),
-            "EXCEPTION": s("EXCEPTION"),
+            "run_id": self.run_id,
+            "generated_at": datetime.now().isoformat(),
+            "source_csv": csv_path,
+            "rows_in_csv": len(rows),
+            "completed_trials_this_session": self.completed_trials,
+            "by_status": {st: n(lambda r, st=st: (r.get("status") or "UNKNOWN") == st)
+                          for st in statuses},
+            "collisions": n(lambda r: str(r.get("collision", "")).strip() in ("1", "1.0", "True")),
+            "treatment_valid": n(lambda r: truthy(r, "treatment_valid")),
+            "treatment_invalid": n(lambda r: not truthy(r, "treatment_valid")),
+            "config_verified": n(lambda r: truthy(r, "config_verified")),
+            "readback_failures": n(
+                lambda r: (r.get("params_readback_failed_count") or "0") not in ("0", "")),
+            "arm_unverified": n(lambda r: str(r.get("arm_verified", "")).strip() == "0"),
+            # Rows whose start pose was never confirmed in Gazebo.
+            "teleport_unverified": n(
+                lambda r: str(r.get("teleport_ok", "1")).strip() == "0"),
+            # Rows where NOTHING was published on /gazebo/collision, so
+            # collision=0 means "not observed", not "did not happen".
+            "collision_channel_silent": n(
+                lambda r: truthy(r, "collision_channel_silent")),
+            # Pose-quantisation regression guard. Should be ~0 with ground
+            # truth; a non-zero count means the pose source reverted to AMCL.
+            "quantised_pose_trials": n(
+                lambda r: _flt(r.get("unique_pose_fraction")) is not None
+                and _flt(r.get("unique_pose_fraction")) < 0.5),
+            # Failure taxonomy: lets infrastructure failures be told apart from
+            # genuine navigation failures without re-reading every row.
+            "by_failure_reason": {
+                fr: n(lambda r, fr=fr: (r.get("failure_reason") or "") == fr)
+                for fr in sorted({(r.get("failure_reason") or "") for r in rows})
+            },
+            # ── dual outcome ────────────────────────────────────────────────
+            # success_true is the estimand. success_believed is what the robot
+            # thought. A large false_success count means an analysis scored on
+            # the belief would have been measuring overconfidence, not arrival.
+            "success_true": n(lambda r: truthy(r, "success_true")),
+            "believed_within_tolerance": n(
+                lambda r: truthy(r, "believed_within_tolerance")),
+            "nav2_reported_success": n(lambda r: truthy(r, "success_believed")),
+            "belief_censored": n(lambda r: truthy(r, "belief_censored")),
+            "outcome_agreement": {
+                oa: n(lambda r, oa=oa: (r.get("outcome_agreement") or "") == oa)
+                for oa in sorted({(r.get("outcome_agreement") or "") for r in rows})
+            },
+            # Robot believed it arrived and did not. The dangerous cell.
+            "false_success": n(
+                lambda r: (r.get("outcome_agreement") or "") == "FALSE_SUCCESS"),
+            "missed_success": n(
+                lambda r: (r.get("outcome_agreement") or "") == "MISSED_SUCCESS"),
+            # Arrived at some point but did not end inside tolerance.
+            "arrived_then_left": n(
+                lambda r: truthy(r, "gt_ever_within_tolerance")
+                and not truthy(r, "success_true")),
+            # Nav2's action result disagreeing with Nav2's OWN goal checker is a
+            # different fault from localization drift and needs separate triage.
+            "nav2_result_inconsistent": n(
+                lambda r: truthy(r, "success_believed")
+                and str(r.get("believed_within_tolerance", "")).strip() == "0"),
+            "mean_belief_error_gap_m": (
+                round(sum(g for g in (_flt(r.get("belief_error_gap_m")) for r in rows)
+                          if g is not None)
+                      / max(sum(1 for r in rows
+                                if _flt(r.get("belief_error_gap_m")) is not None), 1), 4)),
+            "usable_for_causal_analysis": n(
+                lambda r: truthy(r, "treatment_valid")
+                and str(r.get("arm_verified", "")).strip() != "0"
+                and str(r.get("teleport_ok", "1")).strip() != "0"
+                and not truthy(r, "collision_channel_silent")
+                and (_flt(r.get("unique_pose_fraction")) or 1.0) >= 0.5),
         }
+        # Sanity: the status buckets must account for every row.
+        summary["status_counts_sum"] = sum(summary["by_status"].values())
+        summary["status_counts_consistent"] = (
+            summary["status_counts_sum"] == summary["rows_in_csv"])
+
         path = os.path.join(self.config.output_dir, "summary.json")
         with open(path, "w") as f:
             json.dump(summary, f, indent=2)
-        logger.info(f"Summary: {summary}")
+        logger.info(f"Summary: {json.dumps(summary, indent=2)}")
+
+    def shutdown(self):
+        """Release the parameter-applier node. Safe to call more than once."""
+        if self._param_node is not None:
+            try:
+                self._param_node.destroy_node()
+            except Exception:
+                pass
+            self._param_node = None

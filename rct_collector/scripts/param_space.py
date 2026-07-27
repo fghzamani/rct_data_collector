@@ -173,7 +173,7 @@ class ParameterSpace:
             ros_node="local_costmap/local_costmap",
             name="inflation_layer.inflation_radius",
             param_type="continuous",
-            low=0.25, high=0.8,             # live value was 0.55; per-episode (cache rebuild)
+            low=0.15, high=0.6,             # live value was 0.55; per-episode (cache rebuild)
             channel="geometry",
             extra_targets=[("global_costmap/global_costmap",
                             "inflation_layer.inflation_radius")],

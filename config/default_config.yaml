@@ -5,22 +5,29 @@
 #
 # Usage:
 #   python3 -m rct_collector.main --config my_experiment.yaml
+#
+# Unrecognised keys are logged and ignored (see main._config_from_yaml), so a
+# stale setting warns rather than aborting the run.
 # ============================================================================
 
 # --- Trial settings ---
 num_trials: 3000
-trial_timeout_sec: 180.0      # Max seconds per navigation attempt
+trial_timeout_sec: 180.0       # Max seconds per navigation attempt
 cooldown_sec: 5.0              # Seconds between trials (for process cleanup)
 
 # --- Map ---
-# Path to your map's YAML file (the one that points to the .pgm/.png)
-map_yaml_path: "/path/to/your/map.yaml"
+map_yaml_path: "/opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml"
+world_name: "pal_office"
 map_frame: "map"
 
 # --- Pose sampling ---
-min_goal_distance: 14.0         # Minimum Euclidean distance between start and goal (meters)
-max_goal_distance: 15.0        # Maximum distance
-obstacle_clearance_m: 0.5      # Min distance from any obstacle for sampled poses
+# NOTE: the shipped 20-entry pool (presampled_poses-pal_office_20.json) has
+# start-goal distances of 3.15-13.62 m (mean 8.44), i.e. it was generated under
+# a different setting and does NOT satisfy min_goal_distance: 14.0. Regenerate
+# the pool with scripts/generate_pools.py whenever these bounds change.
+min_goal_distance: 10.0         # Min Euclidean distance between start and goal (m)
+max_goal_distance: 20.0
+obstacle_clearance_m: 0.35      # Min distance from any obstacle for sampled poses
 
 # Optional: restrict sampling to a subregion of the map (world coordinates)
 # sampling_bounds:
@@ -29,10 +36,33 @@ obstacle_clearance_m: 0.5      # Min distance from any obstacle for sampled pose
 #   y_min: -3.0
 #   y_max: 8.0
 
-# --- PAL OS integration ---
-pal_config_dir: "~/.pal/config"
-override_filename: "99_rct_override.yaml"  # Must be 90-99 prefix for PAL priority
-nav_module_name: "navigation"              # PAL module to restart
+# --- Pre-generated pools ---
+# Generate both with:
+#   python3 -m rct_collector.scripts.generate_pools --config <this file>
+#
+# A 20-entry pose pool spread over 5000 trials repeats each start/goal pair ~250
+# times; since the route largely determines the risk features, that fits 20
+# memorised routes rather than a generalisable risk x config interaction. Use a
+# few thousand poses.
+presampled_poses_path: "./rct_data/presampled_poses_v2.json"
+presampled_configs_path: "./rct_data/presampled_configs.json"
+
+# Must not be null. The orchestrator now refuses to start without it: an unseeded
+# run cannot be replayed, and configs fall back to per-trial uniform sampling
+# instead of the maximin coverage in ParameterSpace.
+seed: 42                       # Seeds config sampling AND the assignment shuffle
+
+# How trial i picks its entry from the pre-sampled pool:
+#   index    -> pool[i]. Pose becomes a deterministic function of trial order,
+#               so anything drifting over the run is aliased onto the pose factor.
+#   shuffled -> seeded permutations, reshuffled each time the pool is exhausted.
+pose_assignment: "shuffled"
+
+# What to do when the pool is smaller than num_trials. The old behaviour was to
+# silently CLAMP num_trials down to the pool size - a 20-entry pose file turned
+# "num_trials: 3000" into a 20-trial run. Now: reuse (with a warning) or abort.
+allow_pose_reuse: true
+allow_config_reuse: false      # configs are the treatment; reuse must be deliberate
 
 # --- Output ---
 output_dir: "./rct_data"
@@ -41,15 +71,126 @@ results_csv: "rct_results.csv"
 
 # --- Robustness ---
 max_consecutive_failures: 10
-retry_on_nav_failure: false    # Don't retry! Failed trials = valid outcome data
-use_dynamic_reconfig: true     # Also set params via `ros2 param set` (belt-and-suspenders)
-restart_nav_module: true       # Restart PAL nav module to apply config changes
+# Stop if this many trials in a row have a treatment that could not be applied,
+# rather than filling the CSV with rows whose recorded C_t is not the applied C_t.
+max_consecutive_integrity_failures: 5
+
+# --- Parameter application / verification ---
+# Parameters are set over persistent rclpy service clients, not `ros2 param set`
+# subprocesses. Read-back failures are retried before being recorded, and are
+# reported separately from genuine rejections/mismatches in the CSV.
+param_service_timeout_sec: 5.0
+param_readback_attempts: 3
+param_readback_backoff_sec: 0.25
+param_settle_sec: 0.0          # Pause after set, before read-back (costmap rebuilds)
+
+# --- Goal tolerance ---
+# Recorded on every row so SUCCESS is re-derivable during analysis. MUST match
+# the controller_server goal_checker: a mismatch is now FATAL at startup rather
+# than a warning. In the smoke run the runner used 0.25 while Nav2's
+# general_goal_checker.yaw_goal_tolerance was 0.45, so every SUCCESS was decided
+# by a threshold that appears nowhere in the CSV.
+xy_goal_tolerance: 0.35
+yaw_goal_tolerance: 0.65
+check_goal_tolerance_against_nav2: true
+
+# --- Dual outcome: success_true vs success_believed ---
+# Every row now carries three outcome columns:
+#   success_true               ground-truth terminal pose within tolerance.
+#                              THE outcome for causal analysis.
+#   believed_within_tolerance  the same test on the robot's own /amcl_pose
+#                              estimate. Always observable; this is what a real
+#                              robot could compute onboard.
+#   success_believed           Nav2's action result. Blank when this runner
+#                              ended the trial first (belief_censored=1).
+# outcome_agreement summarises the 2x2: AGREE_SUCCESS / AGREE_FAIL /
+# FALSE_SUCCESS / MISSED_SUCCESS. FALSE_SUCCESS is the dangerous cell.
+#
+# Ending a trial the moment ground truth enters the tolerance fires exactly on
+# the trials where success_true == 1, so Nav2 never renders a verdict on those
+# and success_believed goes missing non-randomly. Keep this false unless you
+# have decided you do not need the believed outcome. Arrival is still recorded
+# either way via gt_ever_within_tolerance / t_first_within_tolerance.
+# Cost of false: trials that arrive early no longer end early, so wall-clock
+# per trial rises toward trial_timeout_sec on well-behaved configs.
+stop_when_within_tolerance: false
+
+# --- Ground-truth rate guard ---
+# Startup check on /gazebo/model_states. The gazebo_ros_state plugin defaults to
+# <update_rate>1.0</update_rate>; at 1 Hz the pose is sampled once per second and
+# path_length_m, final_xy_error and min_obstacle_distance are all quantised.
+# Set <update_rate>50.0</update_rate> on the plugin in your world SDF.
+# 0.0 disables the check.
+gt_min_rate_hz: 20.0
+
+# --- Stall detection ---
+# This BT (navigate_w_replanning_only.xml) has no recovery nodes, so a robot
+# that stops making progress will not recover — it just burns the remaining
+# trial_timeout_sec. End it early and label it STUCK instead. The detector is
+# suppressed whenever /gazebo/model_states is silent, so a slow ground-truth
+# publisher cannot be mistaken for a stuck robot. Set to 0.0 to disable the
+# termination; longest_stall_sec is recorded either way.
+no_progress_timeout_sec: 20.0
+no_progress_dist_m: 0.10
+no_progress_yaw_rad: 0.20
 
 # --- Gazebo ---
 reset_gazebo_between_trials: true
+gazebo_robot_model: "tiago"
+
+# --- Arm / footprint treatment ---
+move_arm: false
+arm_control_mode: "joint_trajectory"
+arm_action: "/arm_controller/follow_joint_trajectory"
+play_motion_action: "/play_motion2"
+arm_move_time_sec: 4.0
+arm_move_on_change_only: true
+# The footprint parameter is only a PROXY for the physical arm pose. Confirm the
+# arm actually arrived by comparing /joint_states against the ARM_CONFIGS
+# targets; an action reporting SUCCEEDED is not proof. Goes to arm_verified.
+verify_arm_joints: true
+arm_joint_tolerance_rad: 0.15
+arm_settle_sec: 1.0
+
+# --- Sensing ---
+scan_topic: "/scan_raw"
+odom_topic: "/mobile_base_controller/odom"
+collision_threshold: 0.15
+
+# LiDAR self-return rejection. The raw scan contains returns from the robot's own
+# structure, which are fixed in base_link - without this filter the per-trial
+# minimum latches onto the chassis and min_obstacle_distance becomes a constant
+# (sd 0.0002 m across the smoke run). Drop any hit closer to the base_link
+# origin than the robot's own extent.
+scan_self_filter_radius_m: 0.30
+# Optional explicit [lo, hi] sectors in the LASER frame (degrees) to ignore.
+# scan_angle_mask_deg:
+#   - [-180.0, -150.0]
+#   - [150.0, 180.0]
 
 # --- Risk features (Paper 2 extension) ---
 collect_risk_features: true
-risk_feature_topics:
-  scan: "/scan_raw"
-  costmap: "/local_costmap/costmap"
+risk_topic: "/risk_state"
+
+# Constants of the r_grad DEFINITION, passed through to environment_risk_node.
+# These are deliberately NOT the inflation_radius / cost_scaling_factor
+# treatment values: r_grad is rebuilt from the costmap's lethal (==254) cells,
+# which the inflation layer never overwrites, so the feature still responds to
+# dynamic obstacles while staying independent of C_t. Keep them fixed for the
+# whole campaign and report them alongside the feature definition.
+risk_inflation_radius_m: 0.30
+risk_cost_scaling_factor: 10.0
+
+# --- Ground truth / QA ---
+# Outcomes (path length, final error, clearance, the early-stop tolerance check)
+# are measured from Gazebo ground truth on /gazebo/model_states, published by the
+# same gazebo_ros_state plugin that provides /gazebo/set_entity_state. /amcl_pose
+# is kept only as the robot's belief, so localization_error_m is observable
+# instead of being folded into final_xy_error.
+#
+# The runner aborts at startup if /gazebo/model_states never yields the robot, or
+# if nothing publishes /gazebo/collision. Before the full campaign, confirm the
+# collision channel end to end by driving into a wall:
+#   ros2 topic echo /gazebo/collision &
+#   ros2 topic pub -r 10 /mobile_base_controller/cmd_vel geometry_msgs/msg/Twist \
+#     '{linear: {x: 0.4}, angular: {z: 0.0}}'

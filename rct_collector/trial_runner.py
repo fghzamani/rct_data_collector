@@ -59,9 +59,14 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from std_msgs.msg import Float64MultiArray, Bool, String
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, JointState
 from nav_msgs.msg import Odometry, Path
 from nav2_msgs.srv import GetCostmap
+try:
+    from nav2_msgs.msg import BehaviorTreeLog
+except ImportError:                       # older nav2_msgs
+    BehaviorTreeLog = None
+from gazebo_msgs.msg import ModelStates
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
 import threading
@@ -225,7 +230,7 @@ class TrialResult:
     collision: bool = False
     travel_time_sec: float = 0.0
     path_length_m: float = 0.0                       # controller (executed) path
-    global_path_length_m: float = 0.0               # planned global path
+    initial_global_path_length_m: float = 0.0               # planned global path
     goal_distance_remaining: float = 0.0
     final_xy_error: float = 0.0
     final_yaw_error: float = 0.0
@@ -242,8 +247,36 @@ class TrialResult:
     num_risk_samples: int = 0
     num_controller_samples: int = 0
     json_path: str = ""
+    run_id: str = ""
+    world_name: str = "pal_office"
+
+    # LiDAR self-return diagnostics. If self_hit_fraction is high, the raw scan
+    # is dominated by the robot's own structure and min_obstacle_distance would
+    # be a constant if it were not filtered (see TrialRunnerNode._scan_callback).
+    scan_beams_total: int = 0
+    scan_beams_self: int = 0
+    min_obstacle_distance_valid: bool = True
+
+    # Pose provenance. Outcomes are measured from Gazebo ground truth
+    # (/gazebo/model_states); /amcl_pose is retained only as the robot's BELIEF
+    # so that localization error is observable rather than silently folded into
+    # final_xy_error.
+    pose_source: str = ""
+    gt_msgs_seen: int = 0
+    unique_pose_fraction: float = 0.0
+    localization_error_m: float = float("nan")
+
+    # Teleport fidelity. 0 means the start pose was never confirmed in Gazebo,
+    # so start_x/start_y may not describe where the robot actually began.
+    teleport_ok: int = 1
+
+    # Collision-channel liveness. collision_channel_silent=1 means NOT ONE
+    # message arrived on /gazebo/collision during the trial, so collision=0 is
+    # indistinguishable from "the monitor plugin is not loaded".
+    collision_msgs_seen: int = 0
+    collision_channel_silent: int = 0
     
-    num_replans: int = 0
+    global_planner_ticks: int = 0
     replan_history: list = field(default_factory=list)   # not written to CSV, only JSON
     collision_links: list = field(default_factory=list)  # not written to CSV, only JSON
 
@@ -256,26 +289,198 @@ class TrialResult:
     # cancel landed. Either way it would silently overwrite our status.
     terminated_by_runner: bool = False
 
+    # ── Failure taxonomy ────────────────────────────────────────────────────
+    # status says THAT the trial failed; failure_reason says WHY, so that
+    # infrastructure failures can be dropped instead of being averaged in with
+    # genuine navigation failures. Values:
+    #   NONE                    - no failure
+    #   PLANNING_FAILED_INITIAL - the pre-navigation getPath() found no path
+    #   BT_PLANNER_FAILED       - ComputePathToPose went to FAILURE in the BT
+    #   BT_CONTROLLER_FAILED    - FollowPath went to FAILURE in the BT
+    #   BT_OTHER_FAILED         - some other BT node failed (see bt_failed_node)
+    #   RUNNER_TIMEOUT          - hit TrialRunner.timeout_sec
+    #   STUCK_NO_PROGRESS       - pose static for no_progress_timeout_sec
+    #   COLLISION               - Gazebo contact
+    #   UNKNOWN                 - Nav2 reported failure but the BT log was silent
+    failure_reason: str = "NONE"
+    bt_failed_node: str = ""            # last BT node observed entering FAILURE
+    bt_failure_detail: str = ""         # "FollowPath=3;ComputePathToPose=1"
+    nav2_result: str = ""               # Nav2's own verdict, kept separately
+    longest_stall_sec: float = 0.0      # longest interval with no pose change
+
+    # ── Dual outcome: what happened vs what the robot believed happened ─────
+    #
+    # The estimand for causal analysis is "did the robot physically arrive",
+    # a fact about the world. Nav2's own SUCCEEDED is a fact about its BELIEF,
+    # produced by a goal checker reading /amcl_pose. In the 30-trial smoke run
+    # those two disagreed on 10 of 11 nominal successes, because AMCL drift
+    # (mean 0.39 m, max 0.53 m) exceeded xy_goal_tolerance (0.35 m). Scoring on
+    # the belief silently changes the estimand to "believes it arrived", and a
+    # tuner fitted to that learns to prefer configs that make the robot
+    # confidently wrong.
+    #
+    # Three outcome columns, all recorded on every trial:
+    #
+    #   success_true              ground truth terminal pose within tolerance.
+    #                             THE primary outcome. Measured from
+    #                             /gazebo/model_states.
+    #   believed_within_tolerance the same test applied to the robot's OWN
+    #                             terminal pose estimate (/amcl_pose). Always
+    #                             observable, never censored, and it is exactly
+    #                             what a real robot could compute onboard.
+    #   success_believed          Nav2's action result (SUCCEEDED). Censored
+    #                             when this runner ended the trial first — see
+    #                             belief_censored.
+    #
+    # success_true vs believed_within_tolerance is the 2x2 to analyse; the gap
+    # between them is a result in its own right, not just a nuisance.
+    success_true: Optional[int] = None
+    believed_within_tolerance: Optional[int] = None
+    success_believed: Optional[int] = None
+    belief_censored: int = 0
+
+    # Continuous counterparts, so the gap is measurable and not only binary.
+    believed_final_xy_error: float = float("nan")
+    believed_final_yaw_error: float = float("nan")
+    belief_error_gap_m: float = float("nan")   # true error - believed error
+
+    # AGREE_SUCCESS | AGREE_FAIL | FALSE_SUCCESS | MISSED_SUCCESS | UNOBSERVED
+    # FALSE_SUCCESS is the dangerous cell: the robot thinks it arrived and did
+    # not. MISSED_SUCCESS is the benign one.
+    outcome_agreement: str = ""
+
+    # Did ground truth EVER satisfy both tolerances during the run, even if the
+    # robot then drove away again? Distinguishes "never got there" from "got
+    # there and overshot", which the terminal-pose test alone conflates.
+    gt_ever_within_tolerance: int = 0
+    t_first_within_tolerance: float = float("nan")   # sec from nav start
+
+    # The thresholds this trial was scored against, recorded per row so any
+    # outcome above can be re-derived under a different tolerance later.
+    xy_goal_tolerance_used: float = float("nan")
+    yaw_goal_tolerance_used: float = float("nan")
+
+    def _score_outcomes(self) -> None:
+        """Fill the dual-outcome fields from the errors already measured.
+
+        Called at the end of run_trial(), after both the ground-truth and
+        believed terminal poses are known. Never invents a verdict: trials in
+        which no navigation happened leave the binaries as None so they are
+        written as blank rather than scored as failures.
+        """
+        xy_tol = self.xy_goal_tolerance_used
+        yaw_tol = self.yaw_goal_tolerance_used
+
+        def _within(xy_err: float, yaw_err: float) -> Optional[int]:
+            if not (math.isfinite(xy_err) and math.isfinite(yaw_err)):
+                return None
+            return int(abs(xy_err) <= xy_tol and abs(yaw_err) <= yaw_tol)
+
+        navigated = (self.travel_time_sec or 0.0) > 0.0 and self.status != "PLANNING_FAILED"
+
+        if navigated:
+            self.success_true = _within(self.final_xy_error, self.final_yaw_error)
+            self.believed_within_tolerance = _within(
+                self.believed_final_xy_error, self.believed_final_yaw_error)
+        else:
+            # No navigation: final_xy_error is a 0.0 default, not a measurement.
+            self.success_true = None
+            self.believed_within_tolerance = None
+
+        if math.isfinite(self.final_xy_error) and math.isfinite(self.believed_final_xy_error):
+            self.belief_error_gap_m = float(
+                self.final_xy_error - self.believed_final_xy_error)
+
+        # Nav2's action verdict. Unreliable whenever this runner cancelled the
+        # task first: BasicNavigator only writes its status inside
+        # isTaskComplete(), so after a cancelTask() the value can be left over
+        # from a previous trial or can have latched SUCCEEDED just before the
+        # cancel landed. Record it as censored rather than as a 0.
+        if self.terminated_by_runner or self.collision:
+            self.success_believed = None
+            self.belief_censored = 1
+        elif self.nav2_result == "SUCCEEDED":
+            self.success_believed = 1
+        elif self.nav2_result in ("FAILED", "CANCELED"):
+            self.success_believed = 0
+        else:
+            self.success_believed = None
+            self.belief_censored = 1
+
+        # Agreement is scored on the two POSE-based columns, because those are
+        # both always observable. success_believed (the action result) is kept
+        # as a separate column for diagnosing Nav2 itself.
+        if self.success_true is None or self.believed_within_tolerance is None:
+            self.outcome_agreement = "UNOBSERVED"
+        elif self.success_true == 1 and self.believed_within_tolerance == 1:
+            self.outcome_agreement = "AGREE_SUCCESS"
+        elif self.success_true == 0 and self.believed_within_tolerance == 0:
+            self.outcome_agreement = "AGREE_FAIL"
+        elif self.success_true == 0 and self.believed_within_tolerance == 1:
+            self.outcome_agreement = "FALSE_SUCCESS"
+        else:
+            self.outcome_agreement = "MISSED_SUCCESS"
+
     def to_dict(self) -> dict[str, Any]:
-        """Flat, single-level dict for CSV output."""
+        """Flat, single-level dict for CSV output.
+
+        ``goal_distance_remaining`` is deliberately NOT emitted here: it was
+        exactly equal to ``final_xy_error`` in every row of the smoke run (both
+        are the Euclidean distance from the final pose to the goal), so it only
+        widened the schema. It is still kept on the dataclass and written to the
+        per-trial JSON.
+        """
+        self_frac = (self.scan_beams_self / self.scan_beams_total
+                     if self.scan_beams_total else "")
+
+        def _b(v):
+            """None -> blank cell. Keeps 'not observed' distinct from 0."""
+            return "" if v is None else int(v)
+
         d = {
             "start_x": self.start_x, "start_y": self.start_y, "start_yaw": self.start_yaw,
             "goal_x": self.goal_x, "goal_y": self.goal_y, "goal_yaw": self.goal_yaw,
             "status": self.status,
             "collision": int(self.collision),
+            # ── dual outcome ────────────────────────────────────────────────
+            "success_true": _b(self.success_true),
+            "believed_within_tolerance": _b(self.believed_within_tolerance),
+            "success_believed": _b(self.success_believed),
+            "belief_censored": int(self.belief_censored),
+            "outcome_agreement": self.outcome_agreement,
+            "believed_final_xy_error": self.believed_final_xy_error,
+            "believed_final_yaw_error": self.believed_final_yaw_error,
+            "belief_error_gap_m": self.belief_error_gap_m,
+            "gt_ever_within_tolerance": int(self.gt_ever_within_tolerance),
+            "t_first_within_tolerance": self.t_first_within_tolerance,
+            "xy_goal_tolerance_used": self.xy_goal_tolerance_used,
+            "yaw_goal_tolerance_used": self.yaw_goal_tolerance_used,
             "travel_time_sec": self.travel_time_sec,
             "path_length_m": self.path_length_m,
-            "global_path_length_m": self.global_path_length_m,
-            "goal_distance_remaining": self.goal_distance_remaining,
+            "initial_global_path_length_m": self.initial_global_path_length_m,
             "final_xy_error": self.final_xy_error,
             "final_yaw_error": self.final_yaw_error,
             "min_obstacle_distance": self.min_obstacle_distance,
+            "min_obstacle_distance_valid": int(self.min_obstacle_distance_valid),
+            "scan_self_hit_fraction": self_frac,
             "min_map_obstacle_distance": self.min_map_obstacle_distance,
             "min_global_obstacle_distance": self.min_global_obstacle_distance,
             "num_risk_samples": self.num_risk_samples,
             "num_controller_samples": self.num_controller_samples,
-            "num_replans": self.num_replans,
+            "global_planner_ticks": self.global_planner_ticks,
+            "pose_source": self.pose_source,
+            "gt_msgs_seen": self.gt_msgs_seen,
+            "unique_pose_fraction": self.unique_pose_fraction,
+            "localization_error_m": self.localization_error_m,
+            "teleport_ok": self.teleport_ok,
+            "collision_msgs_seen": self.collision_msgs_seen,
+            "collision_channel_silent": self.collision_channel_silent,
             "json_path": self.json_path,
+            "failure_reason": self.failure_reason,
+            "bt_failed_node": self.bt_failed_node,
+            "bt_failure_detail": self.bt_failure_detail,
+            "nav2_result": self.nav2_result,
+            "longest_stall_sec": round(self.longest_stall_sec, 2),
         }
         for key, val in self.params.items():
             d[f"param__{key}"] = val
@@ -292,11 +497,47 @@ class TrialRunnerNode(Node):
     """
 
     def __init__(self, scan_topic: str, odom_topic: str, risk_topic: str,
-                 collect_risk_features: bool):
+                 collect_risk_features: bool,
+                 self_filter_radius_m: float = 0.30,
+                 angle_mask_deg: Optional[list] = None,
+                 gazebo_robot_model: str = "tiago"):
         super().__init__("rct_trial_runner")
+        self.gazebo_robot_model = gazebo_robot_model
         self.collect_risk_features = collect_risk_features
 
-        # Live state
+        # LiDAR self-return rejection (see _scan_callback).
+        self._self_filter_radius = float(self_filter_radius_m)
+        self._angle_mask_rad = [
+            (math.radians(float(lo)), math.radians(float(hi)))
+            for lo, hi in (angle_mask_deg or [])
+        ]
+        self.scan_beams_total = 0
+        self.scan_beams_self = 0
+
+        # Latest joint positions, for arm-pose verification.
+        self.joint_positions: dict = {}
+        self.joint_states_stamp: float = 0.0
+
+        # Live state.
+        #
+        # Two poses are tracked deliberately:
+        #   gt_*    - Gazebo ground truth (/gazebo/model_states). Continuous,
+        #             exact, physics-rate. ALL outcome variables are measured
+        #             from this: path length, final error, clearance.
+        #   robot_* - the robot's BELIEF (/amcl_pose). Kept only so that
+        #             localization error (gt - belief) is observable, and so
+        #             we can see what Nav2's goal checker was looking at.
+        #
+        # /amcl_pose is republished only after AMCL's update_min_d (~0.28 m),
+        # so it is far too coarse to integrate a trajectory from: the smoke run
+        # produced 477 samples containing 37 distinct poses.
+        self.gt_x = 0.0
+        self.gt_y = 0.0
+        self.gt_yaw = 0.0
+        self.gt_valid = False
+        self.gt_msgs_seen = 0
+        self.gt_model_missing_logged = False
+
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_yaw = 0.0
@@ -326,6 +567,9 @@ class TrialRunnerNode(Node):
         self.controller_path: list[dict] = []
         self.min_scan_overall = float("inf")
         self.collision_links = []
+        # Every message on /gazebo/collision is counted, not just the True ones,
+        # so "no collisions" can be told apart from "no publisher".
+        self.collision_msgs_seen = 0
         
         self.replan_events: deque = deque()
         self.create_subscription(Path, "/plan", self._plan_callback, 5)
@@ -340,6 +584,17 @@ class TrialRunnerNode(Node):
             Odometry, odom_topic, self._odom_callback, sensor_qos)
         self.create_subscription(
             LaserScan, scan_topic, self._scan_callback, sensor_qos)
+        self.create_subscription(
+            JointState, "/joint_states", self._joint_state_callback, sensor_qos)
+        self.create_subscription(
+            ModelStates, "/gazebo/model_states", self._model_states_callback,
+            sensor_qos)
+        # Behaviour-tree transitions. This is the only channel that says WHICH
+        # node failed; BasicNavigator.getResult() collapses everything to FAILED.
+        self.bt_failures: list[dict] = []
+        if BehaviorTreeLog is not None:
+            self.create_subscription(
+                BehaviorTreeLog, "/behavior_tree_log", self._bt_log_callback, 10)
         self.create_subscription(Bool, "/gazebo/collision", self._collision_callback, 5)
         self.create_subscription(String, "/gazebo/collision_info", self._collision_info_callback, 5)
         if collect_risk_features:
@@ -363,21 +618,69 @@ class TrialRunnerNode(Node):
         })
     
     def _pose_callback(self, msg: PoseWithCovarianceStamped):
+        """AMCL pose — the robot's BELIEF about where it is.
+
+        Not used for any outcome variable. Retained so that localization error
+        (ground truth minus belief) is recoverable, and so we can tell what
+        Nav2's goal checker was looking at when it declared SUCCESS.
+        """
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
         self.robot_x = p.x
         self.robot_y = p.y
         self.robot_yaw = quaternion_to_yaw(o.x, o.y, o.z, o.w)
 
-        # Static-map distance from base_link to the nearest obstacle at this pose
-        # (analogue of the LiDAR distance, from the ground-truth map). The
-        # base_link origin in the map frame is just the robot position.
+    def _model_states_callback(self, msg: ModelStates):
+        """Ground-truth pose straight from the physics engine.
+
+        Published by the gazebo_ros_state plugin — the same plugin that provides
+        /gazebo/set_entity_state, which the teleport already relies on, so no
+        extra setup is required. Continuous and exact, unlike /amcl_pose, which
+        is quantised to AMCL's update_min_d.
+        """
+        try:
+            i = msg.name.index(self.gazebo_robot_model)
+        except ValueError:
+            if not self.gt_model_missing_logged:
+                self.get_logger().error(
+                    f"Model '{self.gazebo_robot_model}' not in /gazebo/model_states "
+                    f"(names: {list(msg.name)[:8]}). Ground-truth pose unavailable; "
+                    "outcomes would fall back to AMCL.")
+                self.gt_model_missing_logged = True
+            return
+
+        p = msg.pose[i].position
+        o = msg.pose[i].orientation
+        self.gt_x = p.x
+        self.gt_y = p.y
+        self.gt_yaw = quaternion_to_yaw(o.x, o.y, o.z, o.w)
+        self.gt_valid = True
+        self.gt_msgs_seen += 1
+
+        # Static-map distance from base_link to the nearest obstacle, evaluated
+        # at the TRUE pose rather than the believed one.
         if self._map_obstacles is not None:
             d = _min_dist_base_link_to_obstacles(
-                self._map_obstacles, (self.robot_x, self.robot_y))
+                self._map_obstacles, (self.gt_x, self.gt_y))
             self.min_map_value = d
             if math.isfinite(d):
                 self.min_map_overall = min(self.min_map_overall, d)
+
+    # ── pose accessors ──
+    def pose(self) -> tuple:
+        """(x, y, yaw) for measurement: ground truth when available."""
+        if self.gt_valid:
+            return self.gt_x, self.gt_y, self.gt_yaw
+        return self.robot_x, self.robot_y, self.robot_yaw
+
+    def pose_source(self) -> str:
+        return "gazebo_ground_truth" if self.gt_valid else "amcl"
+
+    def localization_error(self) -> float:
+        """Ground truth minus belief, in metres. NaN if ground truth is absent."""
+        if not self.gt_valid:
+            return float("nan")
+        return float(math.hypot(self.gt_x - self.robot_x, self.gt_y - self.robot_y))
 
     def _odom_callback(self, msg: Odometry):
         self.linear_velocity = msg.twist.twist.linear
@@ -408,8 +711,40 @@ class TrialRunnerNode(Node):
         self._scan_key = key
 
     def _scan_callback(self, msg: LaserScan):
+        """Nearest LiDAR return, in metres from the base_link origin.
+
+        SELF-RETURN FILTERING
+        ---------------------
+        The raw scan (``/scan_raw`` on TIAGo) contains returns from the robot's
+        own structure. Those beams are geometrically fixed in base_link, so the
+        per-trial minimum latched onto them and never moved: across the whole
+        smoke run this metric had a standard deviation of 0.0002 m (0.1898 to
+        0.1908) while the map-based clearance varied with sd 0.26 m, and it was
+        identical for the 'carry' and 'tucked' footprints and for the trials
+        that ended in a collision. It was measuring the chassis, not the world.
+
+        Two filters are applied to the points *after* they are lifted into
+        base_link:
+          1. ``self_filter_radius_m`` — drop any hit closer to the base_link
+             origin than the robot's own extent. This is the robust one: it is
+             a statement about geometry, not about beam indices.
+          2. ``angle_mask_deg`` — optional explicit [lo, hi] sectors (in the
+             laser frame, degrees) to ignore, for known blind spots.
+
+        ``scan_beams_total`` / ``scan_beams_self`` are accumulated so the next
+        run can be checked for this failure mode from the CSV instead of by
+        eyeballing the variance.
+        """
         ranges = np.asarray(msg.ranges, dtype=np.float64)
         valid = np.isfinite(ranges) & (ranges > msg.range_min) & (ranges < msg.range_max)
+
+        if self._angle_mask_rad and valid.any():
+            self._ensure_scan_geometry(msg)
+            n = len(ranges)
+            beam_ang = msg.angle_min + np.arange(n, dtype=np.float64) * msg.angle_increment
+            for lo, hi in self._angle_mask_rad:
+                valid &= ~((beam_ang >= lo) & (beam_ang <= hi))
+
         if not valid.any():
             self.min_scan_value = None
             return
@@ -420,10 +755,38 @@ class TrialRunnerNode(Node):
         # base_link origin (0, 0) to the nearest hit — NOT to the footprint.
         px = self._laser_tx + r * self._scan_ux[valid]
         py = self._laser_ty + r * self._scan_uy[valid]
-        d = float(np.sqrt(px * px + py * py).min())
+        dists = np.sqrt(px * px + py * py)
 
+        n_total = int(dists.size)
+        keep = dists >= self._self_filter_radius
+        n_self = n_total - int(keep.sum())
+
+        self.scan_beams_total += n_total
+        self.scan_beams_self += n_self
+
+        if not keep.any():
+            # Everything the sensor can see is inside our own footprint radius.
+            # Report "unknown" rather than a bogus small number.
+            self.min_scan_value = None
+            return
+
+        d = float(dists[keep].min())
         self.min_scan_value = d
         self.min_scan_overall = min(self.min_scan_overall, d)
+
+    def _joint_state_callback(self, msg):
+        """Latch the most recent joint positions, keyed by joint name.
+
+        Used by the orchestrator to confirm the arm physically reached the pose
+        implied by the footprint treatment. A FollowJointTrajectory action
+        reporting SUCCEEDED is not on its own evidence that the arm arrived.
+        """
+        try:
+            for name, pos in zip(msg.name, msg.position):
+                self.joint_positions[name] = float(pos)
+            self.joint_states_stamp = time.time()
+        except (TypeError, ValueError):
+            pass
 
     def _risk_state_callback(self, msg: Float64MultiArray):
         try:
@@ -434,7 +797,26 @@ class TrialRunnerNode(Node):
         self.latest_risk_state = rec
         self.risk_state_history.append(rec)
         
+    def _bt_log_callback(self, msg):
+        """Record every BT node transition into FAILURE.
+
+        navigate_w_replanning_only.xml has no recovery nodes, so any FAILURE
+        aborts the whole navigation — but the log still distinguishes a planner
+        failure from a controller failure, which the action result does not.
+        """
+        for ev in msg.event_log:
+            if ev.current_status == "FAILURE":
+                self.bt_failures.append({
+                    "t": time.time(),
+                    "node": ev.node_name,
+                    "previous_status": ev.previous_status,
+                })
+
     def _collision_callback(self, msg: Bool):
+        # Count EVERY message, not just the positive ones. A trial that ends
+        # with collision_msgs_seen == 0 tells us nothing about whether a
+        # collision happened — it tells us the monitor was not publishing.
+        self.collision_msgs_seen += 1
         if msg.data:
             self.get_logger().warn("Collision detected by Gazebo plugin!")
             self.is_collided = True
@@ -449,9 +831,14 @@ class TrialRunnerNode(Node):
         """Append the current robot state + latest risk state to the buffer."""
         lin = self.linear_velocity
         ang = self.angular_velocity
+        gx, gy, gyaw = self.pose()
         entry = {
             "timestamp": time.time(),
-            "pose": [self.robot_x, self.robot_y, self.robot_yaw],
+            # Ground truth. Every downstream outcome uses this key.
+            "pose": [gx, gy, gyaw],
+            # What the robot thought at the same instant. The difference is
+            # localization error, not navigation error.
+            "pose_believed": [self.robot_x, self.robot_y, self.robot_yaw],
             "footprint_cost": float(footprint_cost),
             "linear_velocity": [lin.x, lin.y, lin.z] if lin else [0.0, 0.0, 0.0],
             "angular_velocity": [ang.x, ang.y, ang.z] if ang else [0.0, 0.0, 0.0],
@@ -471,8 +858,22 @@ class TrialRunnerNode(Node):
         self.min_map_value = None
         self.min_map_overall = float("inf")
         self.replan_events = deque()
-        self.is_collided = False         
-        self.collision_links = [] 
+        self.is_collided = False
+        self.collision_links = []
+        self.collision_msgs_seen = 0
+        self.gt_msgs_seen = 0
+        self.scan_beams_total = 0
+        self.scan_beams_self = 0
+        self.bt_failures = []
+
+    def get_joint_positions(self, names: list, max_age_sec: float = 5.0) -> Optional[dict]:
+        """Latest positions for `names`, or None if /joint_states is stale/absent."""
+        if not self.joint_positions:
+            return None
+        if max_age_sec is not None and self.joint_states_stamp > 0:
+            if (time.time() - self.joint_states_stamp) > max_age_sec:
+                return None
+        return {n: self.joint_positions[n] for n in names if n in self.joint_positions}
 
 
 # ── Trial runner ──────────────────────────────────────────────────────────────
@@ -503,13 +904,49 @@ class TrialRunner:
         # Goal tolerances used for the runner's own early-stop check. These MUST
         # be kept equal to the goal_checker values in your controller_server
         # params, otherwise the runner and Nav2 can disagree about "arrived".
-        xy_goal_tolerance: float = 0.25,
-        yaw_goal_tolerance: float = 0.25,
-        stop_when_within_tolerance: bool = True,
+        xy_goal_tolerance: float = 0.35,
+        yaw_goal_tolerance: float = 0.65,
+        # DEFAULT CHANGED to False for the dual-outcome design.
+        #
+        # When True, the runner cancels the task the instant GROUND TRUTH
+        # enters the goal tolerance. That is a true-success detector, and it
+        # fires precisely on the trials where success_true == 1 — so Nav2 never
+        # renders its own verdict on exactly those trials and success_believed
+        # goes missing non-randomly. The disagreement between the two outcomes
+        # would then be unmeasurable in the one cell that matters.
+        #
+        # With it False, the trial runs until Nav2 concludes (or timeout /
+        # stall / collision), both verdicts are observed, and arrival is still
+        # detected: gt_ever_within_tolerance and t_first_within_tolerance are
+        # recorded either way. Cost is wall-clock — trials that arrive early no
+        # longer end early.
+        #
+        # Set True only if you do not need success_believed.
+        stop_when_within_tolerance: bool = False,
         # Ignore tolerance hits before this many seconds, so a trial whose start
         # pose already sits inside the goal tolerance is not declared an instant
         # success before the controller has done anything.
         min_trial_time_sec: float = 2.0,
+        # Namespaces every artifact this process writes. Without it, re-running
+        # trial N overwrites trial N's JSON/plot from a previous run, so older
+        # CSV rows end up pointing at a file describing a different trial.
+        run_id: str = "",
+        # LiDAR self-return rejection (see TrialRunnerNode._scan_callback).
+        scan_self_filter_radius_m: float = 0.30,
+        scan_angle_mask_deg: Optional[list] = None,
+        # Startup guard on the ground-truth publish rate. gazebo_ros_state
+        # defaults to 1 Hz, which quantises every pose-derived outcome. 0.0
+        # disables the check.
+        gt_min_rate_hz: float = 20.0,
+        # Stall detection. If the ground-truth pose does not move by at least
+        # no_progress_dist_m / no_progress_yaw_rad within this many seconds, end
+        # the trial as STUCK instead of waiting out timeout_sec. Set to 0.0 to
+        # disable (the stall is then only recorded in longest_stall_sec).
+        # NOTE: the detector is suppressed while no new ground-truth messages
+        # arrive, so a slow /gazebo/model_states publisher cannot fake a stall.
+        no_progress_timeout_sec: float = 20.0,
+        no_progress_dist_m: float = 0.10,
+        no_progress_yaw_rad: float = 0.20,
     ):
         self.timeout_sec = timeout_sec
         self.collision_threshold = collision_threshold
@@ -530,6 +967,13 @@ class TrialRunner:
         self.yaw_goal_tolerance = yaw_goal_tolerance
         self.stop_when_within_tolerance = stop_when_within_tolerance
         self.min_trial_time_sec = min_trial_time_sec
+        self.run_id = run_id or time.strftime("%Y%m%dT%H%M%S")
+        self.scan_self_filter_radius_m = scan_self_filter_radius_m
+        self.scan_angle_mask_deg = scan_angle_mask_deg
+        self.gt_min_rate_hz = gt_min_rate_hz
+        self.no_progress_timeout_sec = no_progress_timeout_sec
+        self.no_progress_dist_m = no_progress_dist_m
+        self.no_progress_yaw_rad = no_progress_yaw_rad
 
         if not rclpy.ok():
             rclpy.init()
@@ -545,7 +989,10 @@ class TrialRunner:
 
         # Persistent recorder node + navigator + costmap client (created once).
         self._recorder = TrialRunnerNode(
-            scan_topic, odom_topic, risk_topic, collect_risk_features)
+            scan_topic, odom_topic, risk_topic, collect_risk_features,
+            self_filter_radius_m=scan_self_filter_radius_m,
+            angle_mask_deg=scan_angle_mask_deg,
+            gazebo_robot_model=gazebo_robot_model)
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._recorder)
         self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
@@ -577,7 +1024,85 @@ class TrialRunner:
         self._initpose_pub = self._navigator.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", qos)
 
+        self._assert_collision_channel()
+        self._wait_for_ground_truth(min_rate_hz=self.gt_min_rate_hz)
+
+    def _assert_collision_channel(self, timeout_sec: float = 10.0):
+        """Refuse to start if nothing publishes /gazebo/collision.
+
+        Without this the entire run records collision=0 for every trial and the
+        result is indistinguishable from a genuinely collision-free run.
+        """
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if self._recorder.count_publishers("/gazebo/collision") > 0:
+                logger.info("  /gazebo/collision has a publisher ✓")
+                return
+            time.sleep(0.5)
+        raise RuntimeError(
+            f"No publisher on /gazebo/collision after {timeout_sec:.0f}s. The "
+            "gazebo_collision_monitor plugin is not loaded, so every trial would "
+            "silently record collision=0. Load the plugin, or set "
+            "require_collision_channel: false to collect without collision labels."
+        )
+
+    def _wait_for_ground_truth(self, timeout_sec: float = 10.0,
+                               min_rate_hz: float = 20.0):
+        """Block until /gazebo/model_states yields the robot, then check its rate.
+
+        Two distinct failure modes, reported separately because the fixes differ:
+
+        1. The topic never names the robot — wrong gazebo_robot_model, or the
+           gazebo_ros_state plugin is not loaded. Outcomes would silently fall
+           back to /amcl_pose.
+        2. The topic is alive but slow. gazebo_ros_state defaults to
+           <update_rate>1.0</update_rate>; at that rate the pose is only sampled
+           once per second, so path_length_m, final_xy_error and
+           min_obstacle_distance are quantised exactly as badly as AMCL would
+           quantise them — and nothing in the CSV distinguishes the two.
+        """
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if self._recorder.gt_valid:
+                logger.info(
+                    f"  Ground-truth pose from /gazebo/model_states ✓ "
+                    f"(model '{self.gazebo_robot_model}')")
+                break
+            time.sleep(0.25)
+        else:
+            raise RuntimeError(
+                f"No ground-truth pose for model '{self.gazebo_robot_model}' on "
+                f"/gazebo/model_states after {timeout_sec:.0f}s. Outcomes would be "
+                "measured from /amcl_pose, which is quantised to AMCL's update_min_d "
+                "(~0.28 m) and cannot support trajectory or final-error measurement. "
+                "Check gazebo_robot_model matches the name in Gazebo."
+            )
+
+        if min_rate_hz <= 0:
+            return
+        n0, t0 = self._recorder.gt_msgs_seen, time.time()
+        time.sleep(2.0)
+        rate = (self._recorder.gt_msgs_seen - n0) / max(time.time() - t0, 1e-6)
+        if rate < min_rate_hz:
+            raise RuntimeError(
+                f"/gazebo/model_states is publishing at {rate:.1f} Hz, below the "
+                f"required {min_rate_hz:.0f} Hz. The gazebo_ros_state plugin "
+                "defaults to <update_rate>1.0</update_rate> — set it to 50 in the "
+                "world SDF. At this rate path_length_m, final_xy_error and "
+                "min_obstacle_distance are all quantised and the run is unusable. "
+                "Set gt_min_rate_hz: 0.0 to bypass this check deliberately."
+            )
+        logger.info(f"  Ground-truth pose rate {rate:.1f} Hz ✓")
+
     # ── public API (called by the orchestrator) ──
+
+    def get_arm_joint_positions(self, names: list) -> Optional[dict]:
+        """Latest /joint_states positions for `names`, or None if unavailable.
+
+        Used by the orchestrator to confirm the physical arm pose matches the
+        footprint treatment for the trial.
+        """
+        return self._recorder.get_joint_positions(names)
     def run_trial(self, trial_id: int, start_pose: dict, goal_pose: dict,
                   params: dict) -> TrialResult:
         """Execute one trial and return its (CSV-friendly) TrialResult."""
@@ -591,10 +1116,14 @@ class TrialRunner:
             start_x=start_pose["x"], start_y=start_pose["y"], start_yaw=start_pose["yaw"],
             goal_x=goal_pose["x"], goal_y=goal_pose["y"], goal_yaw=goal_pose["yaw"],
             params=ParameterSpace().flatten(params),
+            # Stamped up front so they are present even on the early-return
+            # paths below, and so every outcome stays re-derivable from the row.
+            xy_goal_tolerance_used=self.xy_goal_tolerance,
+            yaw_goal_tolerance_used=self.yaw_goal_tolerance,
         )
 
         # 1. Teleport in Gazebo, then localize.
-        self._teleport_robot(start_pose)
+        result.teleport_ok = int(self._teleport_robot(start_pose))
         time.sleep(1.0)  # let physics settle
         init_pose = self._make_pose_stamped(start_pose)
         # self._navigator.setInitialPose(init_pose)
@@ -622,11 +1151,15 @@ class TrialRunner:
         initial_path = self._navigator.getPath(init_pose, goal_stamped)
         if initial_path is None or not initial_path.poses:
             result.status = "PLANNING_FAILED"
+            result.failure_reason = "PLANNING_FAILED_INITIAL"
+            # No navigation happened, so both outcomes are genuinely
+            # unobserved. Scoring here writes them as blank rather than 0.
+            result._score_outcomes()
             self._finalize_json(rec, result, params, global_path=[])
             logger.error("  Initial global planning failed — no path.")
             return result
 
-        global_path_data, result.global_path_length_m, result.min_global_obstacle_distance = \
+        global_path_data, result.initial_global_path_length_m, result.min_global_obstacle_distance = \
             self._analyze_global_path(initial_path, checker, costmap)
 
         # 4. Follow the smoothed path while recording.
@@ -650,7 +1183,13 @@ class TrialRunner:
         # async cancel landed, since a terminal goal cannot be un-terminated.
         # Either way it previously overwrote "TIMEOUT" with "SUCCESS".
         
+        # The BT publishes its terminal transition slightly after the action
+        # result latches. Without this pause the log that names the failing node
+        # arrives after classification and the row reads UNKNOWN.
+        time.sleep(0.25)
+
         nav_result = self._navigator.getResult()
+        result.nav2_result = getattr(nav_result, "name", str(nav_result))
         if result.collision:
             result.status = "COLLISION"
         elif result.terminated_by_runner:
@@ -670,13 +1209,21 @@ class TrialRunner:
         else:
             result.status = result.status or "UNKNOWN"
 
+        self._classify_failure(rec, result)
+
         # 6. Goal distance remaining, final xy error, and final yaw error based on
         # the last pose of the controller path.
         if rec.controller_path:
-            last_pose = rec.controller_path[-1]["pose"]
+            last_pose = rec.controller_path[-1]["pose"]   # ground truth
             last_x, last_y, last_yaw = last_pose[0], last_pose[1], last_pose[2]
+            # The robot's OWN estimate at the same instant. This is what Nav2's
+            # goal checker was reading, and it is the only version a real robot
+            # could compute onboard — so it is recorded as a first-class
+            # outcome, not merely as a diagnostic.
+            believed = rec.controller_path[-1].get("pose_believed")
         else:
-            last_x, last_y, last_yaw = rec.robot_x, rec.robot_y, rec.robot_yaw
+            last_x, last_y, last_yaw = rec.pose()
+            believed = [rec.robot_x, rec.robot_y, rec.robot_yaw]
 
         dx = goal_pose["x"] - last_x
         dy = goal_pose["y"] - last_y
@@ -686,18 +1233,158 @@ class TrialRunner:
         dyaw = goal_pose["yaw"] - last_yaw
         result.final_yaw_error = float(math.atan2(math.sin(dyaw), math.cos(dyaw)))
 
+        if believed and len(believed) >= 3:
+            bdx = goal_pose["x"] - believed[0]
+            bdy = goal_pose["y"] - believed[1]
+            result.believed_final_xy_error = float(math.hypot(bdx, bdy))
+            bdyaw = goal_pose["yaw"] - believed[2]
+            result.believed_final_yaw_error = float(
+                math.atan2(math.sin(bdyaw), math.cos(bdyaw)))
+
         result.min_obstacle_distance = rec.min_scan_overall
         result.min_map_obstacle_distance = rec.min_map_overall
+        result.run_id = self.run_id
+
+        # ── pose provenance and QA ────────────────────────────────────────────
+        result.pose_source = rec.pose_source()
+        result.gt_msgs_seen = rec.gt_msgs_seen
+        result.localization_error_m = rec.localization_error()
+
+        # Regression guard on pose quantisation. Under /amcl_pose this was
+        # 0.078 on trial 3 (37 distinct poses in 477 samples); with ground truth
+        # it should sit above ~0.95. A low value means the pose source has
+        # silently reverted.
+        poses = [tuple(smp["pose"]) for smp in rec.controller_path]
+        result.unique_pose_fraction = (len(set(poses)) / len(poses)) if poses else 0.0
+        if poses and result.unique_pose_fraction < 0.5:
+            logger.warning(
+                f"  Only {result.unique_pose_fraction:.0%} of recorded poses are "
+                "distinct — the pose source looks quantised. Path length and "
+                "final error are unreliable for this trial.")
+
+        # ── collision-channel liveness ────────────────────────────────────────
+        result.collision_msgs_seen = rec.collision_msgs_seen
+        result.collision_channel_silent = int(rec.collision_msgs_seen == 0)
+        if result.collision_channel_silent:
+            logger.error(
+                "  No messages on /gazebo/collision during this trial. "
+                "collision=0 here means 'not observed', NOT 'did not happen'. "
+                "Row flagged collision_channel_silent=1.")
+
+        if not result.teleport_ok:
+            logger.error(
+                "  Start pose was never confirmed in Gazebo; start_x/start_y may "
+                "not describe where this trial actually began (teleport_ok=0).")
+
+        # LiDAR self-return diagnostics: surfaced per trial so a scan dominated
+        # by the robot's own structure is visible in the CSV rather than only
+        # detectable by noticing that min_obstacle_distance never varies.
+        result.scan_beams_total = rec.scan_beams_total
+        result.scan_beams_self = rec.scan_beams_self
+        result.min_obstacle_distance_valid = math.isfinite(rec.min_scan_overall)
+        if rec.scan_beams_total:
+            self_frac = rec.scan_beams_self / rec.scan_beams_total
+            if self_frac > 0.5:
+                logger.warning(
+                    f"  {self_frac:.0%} of LiDAR returns fell inside the "
+                    f"self-filter radius ({self.scan_self_filter_radius_m} m). "
+                    f"Check the scan topic and the filter radius."
+                )
+        if not result.min_obstacle_distance_valid:
+            logger.warning(
+                "  No usable LiDAR returns this trial; min_obstacle_distance "
+                "recorded as invalid rather than as a placeholder value.")
+
+        # ── dual outcome scoring ─────────────────────────────────────────────
+        result._score_outcomes()
+
+        if result.outcome_agreement == "FALSE_SUCCESS":
+            logger.warning(
+                f"  FALSE SUCCESS: the robot believes it arrived "
+                f"(believed error {result.believed_final_xy_error:.3f} m) but "
+                f"ground truth puts it {result.final_xy_error:.3f} m from the "
+                f"goal (tolerance {result.xy_goal_tolerance_used:.3f} m). "
+                f"Localization error {result.localization_error_m:.3f} m.")
+        elif result.outcome_agreement == "MISSED_SUCCESS":
+            logger.info(
+                f"  Missed success: ground truth is within tolerance "
+                f"({result.final_xy_error:.3f} m) but the robot believes it is "
+                f"{result.believed_final_xy_error:.3f} m away.")
+
+        # Nav2 claiming SUCCEEDED while its OWN estimate is outside tolerance is
+        # a different fault from localization drift: the action result and the
+        # goal checker disagree with each other, not with the world.
+        if (result.success_believed == 1
+                and result.believed_within_tolerance == 0):
+            logger.error(
+                f"  Nav2 returned SUCCEEDED but its own believed pose is "
+                f"{result.believed_final_xy_error:.3f} m from the goal "
+                f"(tolerance {result.xy_goal_tolerance_used:.3f} m). This is not "
+                "localization error — the action result does not match the goal "
+                "checker. Treat this row's success_believed as suspect.")
 
         # 7. Persist the full time-series JSON.
         self._finalize_json(rec, result, params, global_path=global_path_data)
 
+        def _fmt(v):
+            return "-" if v is None else str(v)
+
         logger.info(
             f"  Trial {trial_id} complete: status={result.status}, "
+            f"success_true={_fmt(result.success_true)}, "
+            f"believed={_fmt(result.believed_within_tolerance)}, "
+            f"nav2={_fmt(result.success_believed)} "
+            f"[{result.outcome_agreement}], "
             f"time={result.travel_time_sec:.1f}s, path={result.path_length_m:.2f}m, "
             f"risk_samples={result.num_risk_samples}"
         )
         return result
+
+    # Leaf nodes of navigate_w_replanning_only.xml. Container nodes
+    # (PipelineSequence, RateController) also transition to FAILURE, but only as
+    # a consequence of a leaf failing, so they are poor explanations.
+    _BT_LEAF_REASONS = {
+        "ComputePathToPose": "BT_PLANNER_FAILED",
+        "FollowPath": "BT_CONTROLLER_FAILED",
+    }
+
+    def _classify_failure(self, rec: TrialRunnerNode, result: TrialResult) -> None:
+        """Fill failure_reason / bt_failed_node from the behaviour-tree log.
+
+        Runner-decided reasons (STUCK_NO_PROGRESS, RUNNER_TIMEOUT) are already
+        set at the break site and are authoritative — the BT log is only
+        consulted for outcomes Nav2 decided on its own.
+        """
+        failures = list(rec.bt_failures)
+        counts: dict[str, int] = {}
+        for f in failures:
+            counts[f["node"]] = counts.get(f["node"], 0) + 1
+        result.bt_failure_detail = ";".join(
+            f"{k}={v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+
+        # Prefer the last LEAF failure; container nodes only echo it.
+        leaf = next((f["node"] for f in reversed(failures)
+                     if f["node"] in self._BT_LEAF_REASONS), None)
+        result.bt_failed_node = leaf or (failures[-1]["node"] if failures else "")
+
+        if result.failure_reason != "NONE":
+            return                                   # runner already decided
+        if result.collision:
+            result.failure_reason = "COLLISION"
+        elif result.status == "SUCCESS":
+            result.failure_reason = "NONE"
+        elif leaf is not None:
+            result.failure_reason = self._BT_LEAF_REASONS[leaf]
+        elif failures:
+            result.failure_reason = "BT_OTHER_FAILED"
+        elif result.status in ("FAILED", "CANCELED", "UNKNOWN"):
+            result.failure_reason = "UNKNOWN"
+
+        if result.failure_reason == "UNKNOWN" and BehaviorTreeLog is None:
+            logger.warning(
+                "  nav2_msgs.msg.BehaviorTreeLog is unavailable, so no failure "
+                "reason could be recovered. Rebuild against a nav2_msgs that "
+                "provides it, or failure_reason will be UNKNOWN for every row.")
 
     def shutdown(self):
         try:
@@ -768,9 +1455,13 @@ class TrialRunner:
         t_start = time.time()
         result.t_nav_start = t_start
         last_record = t_start
-        prev_pose = [rec.robot_x, rec.robot_y]
+        _px, _py, _pyaw = rec.pose()
+        prev_pose = [_px, _py]
         local_len = 0.0
         self._pending_replans = []
+        stall_ref = (_px, _py, _pyaw)      # pose the stall window is measured from
+        stall_t0 = t_start
+        stall_gt0 = rec.gt_msgs_seen
 
         while not self._navigator.isTaskComplete():
             time.sleep(0.01)
@@ -783,41 +1474,92 @@ class TrialRunner:
             while rec.replan_events:
                 self._pending_replans.append(rec.replan_events.popleft())
 
+            # Ground truth throughout: footprint cost, path length and the
+            # tolerance check are all outcome measurements and must not be
+            # contaminated by localization error.
+            rx, ry, ryaw = rec.pose()
+
             footprint_cost = 0.0
             if checker is not None:
-                footprint_cost = checker.footprintCostAtPose(
-                    rec.robot_x, rec.robot_y, rec.robot_yaw)
+                footprint_cost = checker.footprintCostAtPose(rx, ry, ryaw)
 
             if now - last_record >= self.record_period:
                 rec.record_sample(footprint_cost)
                 last_record = now
-                local_len += math.hypot(rec.robot_x - prev_pose[0], rec.robot_y - prev_pose[1])
-                prev_pose = [rec.robot_x, rec.robot_y]
+                local_len += math.hypot(rx - prev_pose[0], ry - prev_pose[1])
+                prev_pose = [rx, ry]
+
+            # Stall detection. The window restarts whenever the robot moves in
+            # translation OR rotation, so a legitimate in-place yaw correction
+            # near the goal is not mistaken for being stuck.
+            _moved_xy = math.hypot(rx - stall_ref[0], ry - stall_ref[1])
+            _moved_yaw = abs(math.atan2(math.sin(ryaw - stall_ref[2]),
+                                        math.cos(ryaw - stall_ref[2])))
+            if (_moved_xy >= self.no_progress_dist_m
+                    or _moved_yaw >= self.no_progress_yaw_rad):
+                stall_ref = (rx, ry, ryaw)
+                stall_t0 = now
+                stall_gt0 = rec.gt_msgs_seen
+            else:
+                stall_len = now - stall_t0
+                result.longest_stall_sec = max(result.longest_stall_sec, stall_len)
+                # Only trust the stall if ground truth actually refreshed during
+                # the window. A silent pose topic looks identical to a stuck
+                # robot, and must not be scored as one.
+                if (self.no_progress_timeout_sec > 0
+                        and stall_len > self.no_progress_timeout_sec
+                        and rec.gt_msgs_seen > stall_gt0):
+                    rec.record_sample(footprint_cost)
+                    self._navigator.cancelTask()
+                    result.status = "STUCK"
+                    result.failure_reason = "STUCK_NO_PROGRESS"
+                    result.terminated_by_runner = True
+                    logger.warning(
+                        f"  No progress for {stall_len:.1f}s "
+                        f"(moved {_moved_xy:.3f}m / {_moved_yaw:.3f}rad) — "
+                        "ending trial as STUCK.")
+                    break
 
             # Early termination: the robot is inside the goal tolerance.
             # Requires xy AND yaw to be satisfied at the SAME pose, so the
             # controller cannot loiter doing repeated heading corrections near
             # the goal (the behaviour that was tripping the timeout). Measured
-            # from rec.robot_* — the same /amcl_pose source used for the final
-            # error below — so a SUCCESS declared here always has final error
-            # within tolerance.
-            if self.stop_when_within_tolerance and elapsed >= self.min_trial_time_sec:
-                _dx = result.goal_x - rec.robot_x
-                _dy = result.goal_y - rec.robot_y
+            # from ground truth — the same source used for the final error
+            # below — so a SUCCESS declared here always has final error within
+            # tolerance. Under the old /amcl_pose source this branch could
+            # essentially never fire: it tested a 0.25 m threshold against a
+            # pose quantised to 0.28 m, and terminated_by_runner was False in
+            # 20 of 20 smoke trials.
+            # Arrival is ALWAYS observed and timestamped, whether or not it
+            # ends the trial. gt_ever_within_tolerance separates "never got
+            # there" from "got there and then drove away again", which the
+            # terminal-pose test on its own conflates.
+            if elapsed >= self.min_trial_time_sec:
+                _dx = result.goal_x - rx
+                _dy = result.goal_y - ry
                 _xy_err = math.hypot(_dx, _dy)
-                _dyaw = result.goal_yaw - rec.robot_yaw
+                _dyaw = result.goal_yaw - ryaw
                 _yaw_err = abs(math.atan2(math.sin(_dyaw), math.cos(_dyaw)))
-                if (_xy_err <= self.xy_goal_tolerance
-                        and _yaw_err <= self.yaw_goal_tolerance):
+                _arrived = (_xy_err <= self.xy_goal_tolerance
+                            and _yaw_err <= self.yaw_goal_tolerance)
+
+                if _arrived and not result.gt_ever_within_tolerance:
+                    result.gt_ever_within_tolerance = 1
+                    result.t_first_within_tolerance = elapsed
+                    logger.info(
+                        f"  Ground truth entered goal tolerance at {elapsed:.1f}s "
+                        f"(xy={_xy_err:.3f}m, yaw={_yaw_err:.3f}rad).")
+
+                # Terminating here censors Nav2's verdict on exactly the trials
+                # that succeeded, so it is off by default. See the constructor.
+                if _arrived and self.stop_when_within_tolerance:
                     rec.record_sample(footprint_cost)
                     self._navigator.cancelTask()
                     result.status = "SUCCESS"
                     result.terminated_by_runner = True
                     logger.info(
-                        f"  Within goal tolerance (xy={_xy_err:.3f}m <= "
-                        f"{self.xy_goal_tolerance:.3f}, yaw={_yaw_err:.3f}rad <= "
-                        f"{self.yaw_goal_tolerance:.3f}) after {elapsed:.1f}s — "
-                        "ending trial.")
+                        "  stop_when_within_tolerance=True — ending trial here. "
+                        "success_believed will be censored for this row.")
                     break
 
             # Ground-truth collision from Gazebo physics contacts (gazebo_collision_monitor
@@ -834,9 +1576,20 @@ class TrialRunner:
             if elapsed > self.timeout_sec:
                 self._navigator.cancelTask()
                 result.status = "TIMEOUT"
+                result.failure_reason = "RUNNER_TIMEOUT"
                 result.terminated_by_runner = True
                 logger.warning(f"  Trial timed out after {elapsed:.1f}s")
                 break
+
+        else:
+            # Loop exited because Nav2 finished on its own (no break). Every
+            # break path already recorded a final sample; this path did not, so
+            # the last sample could be up to record_period old. Both outcomes
+            # are computed from the LAST sample's pose and pose_believed, so a
+            # stale terminal pose biases them directly — take one more now.
+            rx, ry, ryaw = rec.pose()
+            fc = checker.footprintCostAtPose(rx, ry, ryaw) if checker is not None else 0.0
+            rec.record_sample(fc)
 
         rec._recording = False
         result.t_nav_end = time.time()
@@ -859,7 +1612,7 @@ class TrialRunner:
             self._analyze_replan(ev, footprint_checker, costmap)
             for ev in self._pending_replans
         ]
-        result.num_replans = len(replan_analyses)
+        result.global_planner_ticks = len(replan_analyses)
         result.replan_history = replan_analyses
 
     # ── helpers ──
@@ -1070,27 +1823,87 @@ class TrialRunner:
             })
         return data, total_len, min_dist
 
-    def _teleport_robot(self, pose: dict):
-        """Teleport the robot in Gazebo to the start pose (best effort)."""
+    def _teleport_robot(self, pose: dict, attempts: int = 3,
+                        tol_xy: float = 0.10) -> bool:
+        """Teleport in Gazebo and VERIFY the robot arrived. Returns success.
+
+        The previous version was fire-and-forget: on a service TIMEOUT it logged
+        a warning, skipped the fallback entirely (the fallback was gated on
+        returncode != 0, which a TimeoutExpired never reaches) and returned. Two
+        of twenty smoke trials hit that path and were still recorded as normal
+        rows, one of them as SUCCESS. Verification now uses the ground-truth
+        pose already streaming on /gazebo/model_states, so confirming costs
+        nothing extra.
+        """
         _, _, qz, qw = yaw_to_quaternion(float(pose["yaw"]))
         state = (
             f'{{"state": {{"name": "{self.gazebo_robot_model}", '
             f'"pose": {{"position": {{"x": {pose["x"]}, "y": {pose["y"]}, "z": 0.0}}, '
             f'"orientation": {{"z": {qz}, "w": {qw}}}}}}}}}'
         )
-        cmd = ["ros2", "service", "call", "/gazebo/set_entity_state",
-               "gazebo_msgs/srv/SetEntityState", state]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
-                logger.info(f"  Teleported to ({pose['x']:.2f}, {pose['y']:.2f})")
-            else:
-                logger.debug("  set_entity_state failed; trying set_model_state...")
-                cmd[3] = "gazebo_msgs/srv/SetModelState"
-                cmd[2] = "/set_model_state"
-                subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        except Exception as e:
-            logger.warning(f"  Teleport failed: {e}. Robot may not be at start pose.")
+        services = (
+            ("/gazebo/set_entity_state", "gazebo_msgs/srv/SetEntityState"),
+            ("/set_model_state", "gazebo_msgs/srv/SetModelState"),
+        )
+
+        for attempt in range(1, attempts + 1):
+            for srv, typ in services:
+                try:
+                    subprocess.run(["ros2", "service", "call", srv, typ, state],
+                                   capture_output=True, text=True, timeout=15)
+                except subprocess.TimeoutExpired:
+                    logger.warning(
+                        f"  {srv} timed out (attempt {attempt}/{attempts})")
+                    continue
+                except Exception as e:
+                    logger.warning(f"  {srv} failed: {e}")
+                    continue
+
+                if self._verify_gazebo_pose(pose, tol_xy=tol_xy):
+                    logger.info(
+                        f"  Teleported to ({pose['x']:.2f}, {pose['y']:.2f}) ✓")
+                    return True
+            time.sleep(1.0)
+
+        gx, gy, _ = self._recorder.pose()
+        logger.error(
+            f"  TELEPORT UNVERIFIED after {attempts} attempts. Requested "
+            f"({pose['x']:.2f}, {pose['y']:.2f}), ground truth reports "
+            f"({gx:.2f}, {gy:.2f}). Row flagged teleport_ok=0.")
+        return False
+
+    def _verify_gazebo_pose(self, pose: dict, tol_xy: float = 0.10,
+                            settle_sec: float = 0.5) -> bool:
+        """Confirm the ground-truth pose matches the requested one."""
+        deadline = time.time() + settle_sec
+        while time.time() < deadline:
+            time.sleep(0.05)
+        if not self._recorder.gt_valid:
+            return False
+        gx, gy, _ = self._recorder.pose()
+        return math.hypot(gx - float(pose["x"]), gy - float(pose["y"])) <= tol_xy
+
+    @staticmethod
+    def _json_safe(obj):
+        """Convert non-finite floats to None.
+
+        The risk features now return NaN when a value genuinely cannot be
+        computed (rather than a misleading 0.0). json.dump would write a bare
+        `NaN`, which Python reads back happily but which is not valid strict
+        JSON — pandas.read_json, jq and most non-Python parsers reject it.
+        """
+        if isinstance(obj, float):
+            return obj if math.isfinite(obj) else None
+        if isinstance(obj, dict):
+            return {k: TrialRunner._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [TrialRunner._json_safe(v) for v in obj]
+        if isinstance(obj, np.floating):
+            f = float(obj)
+            return f if math.isfinite(f) else None
+        if isinstance(obj, np.integer):
+            return int(obj)
+        return obj
 
     def _finalize_json(self, rec: TrialRunnerNode, result: TrialResult, params: dict,
                        global_path: list):
@@ -1103,7 +1916,7 @@ class TrialRunner:
             "terminated_by_runner": result.terminated_by_runner,
             "is_collided": result.collision,
             "travel_time_sec": result.travel_time_sec,
-            "global_path_length": result.global_path_length_m,
+            "global_path_length": result.initial_global_path_length_m,
             "local_path_length": result.path_length_m,
             "min_global_dist_to_obstacle": result.min_global_obstacle_distance,
             "min_obstacle_distance": result.min_obstacle_distance,
@@ -1111,6 +1924,19 @@ class TrialRunner:
             "goal_distance_remaining": result.goal_distance_remaining,
             "final_xy_error": result.final_xy_error,
             "final_yaw_error": result.final_yaw_error,
+            # Dual outcome, mirrored from the CSV so a trial JSON stands alone.
+            "success_true": result.success_true,
+            "believed_within_tolerance": result.believed_within_tolerance,
+            "success_believed": result.success_believed,
+            "belief_censored": result.belief_censored,
+            "outcome_agreement": result.outcome_agreement,
+            "believed_final_xy_error": result.believed_final_xy_error,
+            "believed_final_yaw_error": result.believed_final_yaw_error,
+            "belief_error_gap_m": result.belief_error_gap_m,
+            "gt_ever_within_tolerance": result.gt_ever_within_tolerance,
+            "t_first_within_tolerance": result.t_first_within_tolerance,
+            "xy_goal_tolerance_used": result.xy_goal_tolerance_used,
+            "yaw_goal_tolerance_used": result.yaw_goal_tolerance_used,
             "initial_pose": {"x": result.start_x, "y": result.start_y, "yaw": result.start_yaw},
             "goal_pose": {"x": result.goal_x, "y": result.goal_y, "yaw": result.goal_yaw},
             "nav2_config": result.params,
@@ -1120,13 +1946,25 @@ class TrialRunner:
             "num_risk_samples": len(rec.risk_state_history),
             "num_controller_samples": len(rec.controller_path),
             "map_yaml": self.map_yaml_path,
-            "num__global_replans": result.num_replans,
+            "num__global_replans": result.global_planner_ticks,
             "global_replan_history": result.replan_history,
             "collision_links": result.collision_links,
+            # Pose provenance / QA, mirrored from the CSV so a trial JSON is
+            # self-contained.
+            "pose_source": result.pose_source,
+            "gt_msgs_seen": result.gt_msgs_seen,
+            "unique_pose_fraction": result.unique_pose_fraction,
+            "localization_error_m": result.localization_error_m,
+            "teleport_ok": result.teleport_ok,
+            "collision_msgs_seen": result.collision_msgs_seen,
+            "collision_channel_silent": result.collision_channel_silent,
         }
-        path = os.path.join(self.output_dir, "trials", f"trial_{result.trial_id:05d}.json")
+        # Namespaced by run_id: re-running trial N in a later session no longer
+        # clobbers the JSON that an earlier CSV row points at.
+        path = os.path.join(self.output_dir, "trials",
+                            f"trial_{self.run_id}_{result.trial_id:05d}.json")
         with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
+            json.dump(self._json_safe(payload), f, indent=2)
         result.json_path = path
 
         if self.generate_plots:
@@ -1165,7 +2003,8 @@ class TrialRunner:
                 plt.plot(cx, cy, "b.-", ms=2, lw=1, label="Executed path")
             plt.legend()
             plt.title(f"Trial {result.trial_id} — {result.status}")
-            out = os.path.join(self.output_dir, "trials", f"plot_{result.trial_id:05d}.png")
+            out = os.path.join(self.output_dir, "trials",
+                               f"plot_{self.run_id}_{result.trial_id:05d}.png")
             plt.savefig(out, dpi=150, bbox_inches="tight")
             plt.close()
         except Exception as e:

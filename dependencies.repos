@@ -9,8 +9,8 @@ repositories:
     version: main
   pal_gazebo_worlds:
     type: git
-    url: https://github.com/pal-robotics/pal_gazebo_worlds.git
-    version: humble-devel
+    url: https://github.com/fghzamani/pal_gazebo_worlds.git
+    version: 
   pmb2_navigation:
     type: git
     url: https://github.com/fghzamani/pmb2_navigation.git

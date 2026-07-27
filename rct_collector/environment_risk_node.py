@@ -39,9 +39,22 @@ from nav2_msgs.msg import Costmap
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_msgs.msg import Float64MultiArray, MultiArrayDimension, MultiArrayLayout
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
+from tf2_ros import Buffer, TransformListener
+from rclpy.time import Time
 
 import numpy as np
 from typing import Optional, Tuple, List
+
+# r_grad rebuilds its own inflation from the costmap's lethal cells, which needs
+# a Euclidean distance transform. Import once at module scope; failing loudly at
+# startup is better than raising inside every compute cycle.
+try:
+    from scipy import ndimage as _ndimage
+except ImportError as _e:  # pragma: no cover
+    _ndimage = None
+    logging.getLogger(__name__).error(
+        "scipy is unavailable (%s); r_grad will be NaN for the whole run. "
+        "Install scipy or set collect_risk_features accordingly.", _e)
 from dataclasses import dataclass, field
 from enum import IntEnum
 import time
@@ -86,6 +99,12 @@ class RiskStateConfig:
     default_r_ttc: float = 100.0
     default_r_width: float = 10.0
 
+    # LiDAR self-return rejection — must match trial_runner's
+    # scan_self_filter_radius_m or the two pipelines disagree.
+    scan_self_filter_radius_m: float = 0.30
+    scan_angle_mask_deg: tuple = ()     # flat [lo1,hi1,lo2,hi2,...] in LASER frame
+    risk_inflation_radius_m: float = 0.3   # FIXED — must not track the treatment
+    risk_cost_scaling_factor: float = 10.0
 
 @dataclass 
 class SensorState:
@@ -115,6 +134,7 @@ class SensorState:
     costmap_width: int = 0
     costmap_height: int = 0
     costmap_timestamp: float = 0.0
+    costmap_frame: str = ""
     
     # Path
     path_points: Optional[np.ndarray] = None
@@ -141,6 +161,7 @@ class ComputeCache:
     # Pre-allocated arrays for computation
     histogram: Optional[np.ndarray] = None
     valid_ranges: Optional[np.ndarray] = None
+    angle_keep_mask: Optional[np.ndarray] = None
 
 
 class OptimizedRiskStateNode(Node):
@@ -202,7 +223,19 @@ class OptimizedRiskStateNode(Node):
         # Callback groups
         self._sensor_cb_group = ReentrantCallbackGroup()
         self._compute_cb_group = MutuallyExclusiveCallbackGroup()
-        
+        # TF: the costmap origin is expressed in the costmap's own frame
+        # (odom for the local costmap), while robot_x/robot_y come from
+        # /amcl_pose in the map frame. Without this, r_dens and r_grad index
+        # the grid with map-frame coordinates and silently return 0.
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._tf_failures = 0
+        self._tf_attempts = 0
+
+
+
+
+
         # Get topic names from parameters
         scan_topic = self.get_parameter('scan_topic').value
         odom_topic = self.get_parameter('odom_topic').value
@@ -275,6 +308,16 @@ class OptimizedRiskStateNode(Node):
         self.declare_parameter('blocked_distance', 3.0)
         self.declare_parameter('num_polar_sectors', 36)
         self.declare_parameter('forward_sector_half_angle', np.pi / 3)
+        self.declare_parameter('scan_self_filter_radius_m', 0.30)
+        self.declare_parameter('scan_angle_mask_deg', [])
+        # Constants of the r_grad DEFINITION. These deliberately do NOT track
+        # the inflation_radius / cost_scaling_factor treatment: if they did,
+        # r_grad would be a function of C_t and the risk x config interaction
+        # would partly be the treatment interacting with itself. Pin them in
+        # the experiment config and report them in the paper.
+        self.declare_parameter('risk_inflation_radius_m', 0.30)
+        self.declare_parameter('risk_cost_scaling_factor', 10.0)
+    
     
     def _load_config(self) -> RiskStateConfig:
         """Load configuration from parameters."""
@@ -286,6 +329,10 @@ class OptimizedRiskStateNode(Node):
             blocked_distance=self.get_parameter('blocked_distance').value,
             num_polar_sectors=self.get_parameter('num_polar_sectors').value,
             forward_sector_half_angle=self.get_parameter('forward_sector_half_angle').value,
+            scan_self_filter_radius_m=self.get_parameter('scan_self_filter_radius_m').value,
+            scan_angle_mask_deg=tuple(self.get_parameter('scan_angle_mask_deg').value or ()),
+            risk_inflation_radius_m=self.get_parameter('risk_inflation_radius_m').value,
+            risk_cost_scaling_factor=self.get_parameter('risk_cost_scaling_factor').value,
         )
     
     # =========================================================================
@@ -320,6 +367,14 @@ class OptimizedRiskStateNode(Node):
         # Pre-compute forward mask for TTC and visibility
         self.cache.forward_mask = np.abs(angles) < self.config.forward_sector_half_angle
         
+        keep = np.ones(num_beams, dtype=bool)
+        m = self.config.scan_angle_mask_deg
+        for lo, hi in zip(m[0::2], m[1::2]):
+            keep &= ~((angles >= np.deg2rad(lo)) & (angles <= np.deg2rad(hi)))
+        self.cache.angle_keep_mask = keep
+        self.get_logger().info(
+            f'Scan geometry: {num_beams} beams, {int((~keep).sum())} masked by angle, '
+            f'self-filter radius {self.config.scan_self_filter_radius_m} m')
         # Pre-allocate valid_ranges array
         self.cache.valid_ranges = np.empty(num_beams, dtype=np.float32)
         
@@ -359,6 +414,7 @@ class OptimizedRiskStateNode(Node):
         self.sensor_state.costmap_width = msg.metadata.size_x
         self.sensor_state.costmap_height = msg.metadata.size_y
         self.sensor_state.costmap_timestamp = time.time()
+        self.sensor_state.costmap_frame = msg.header.frame_id
         
         # Invalidate gradient cache (will be recomputed on next use)
         # Don't compute here - let the compute cycle handle it lazily
@@ -467,102 +523,129 @@ class OptimizedRiskStateNode(Node):
     # =========================================================================
     # COMPONENT COMPUTATIONS (Vectorized and optimized)
     # =========================================================================
+    def _robot_in_costmap_frame(self):
+        """Robot (x, y) expressed in the costmap's own frame, or None."""
+        frame = self.sensor_state.costmap_frame
+        if not frame:
+            return None
+        if frame == 'map':
+            return self.sensor_state.robot_x, self.sensor_state.robot_y
+        self._tf_attempts += 1
+        try:
+            tf = self._tf_buffer.lookup_transform(frame, 'base_link', Time())
+        except Exception:
+            self._tf_failures += 1
+            return None
+        return tf.transform.translation.x, tf.transform.translation.y
     
-    def _compute_r_min(self) -> float:
-        """R_min: Minimum distance to any obstacle."""
+    def _valid_scan_mask(self, extra: Optional[np.ndarray] = None) -> np.ndarray:
+        """Beams that are real world returns.
+
+        Rejects (a) below-range_min, (b) above-range_max, (c) NaN/inf,
+        (d) returns from the robot's own structure inside the self-filter
+        radius, (e) explicitly masked angular sectors.
+        """
         ranges = self.sensor_state.scan_ranges
-        r_min = self.sensor_state.scan_range_min
-        r_max = self.sensor_state.scan_range_max
-        
-        # Vectorized valid mask and minimum
-        valid_mask = (ranges > r_min) & (ranges < r_max)
-        
-        if not np.any(valid_mask):
+        lo = max(self.sensor_state.scan_range_min,
+                 self.config.scan_self_filter_radius_m)
+        mask = np.isfinite(ranges) & (ranges > lo) & (ranges < self.sensor_state.scan_range_max)
+        if self.cache.angle_keep_mask is not None:
+            mask &= self.cache.angle_keep_mask
+        if extra is not None:
+            mask &= extra
+        return mask
+
+    def self_hit_fraction(self) -> float:
+        r = self.sensor_state.scan_ranges
+        if r is None or r.size == 0:
+            return 0.0
+        finite = np.isfinite(r)
+        if not finite.any():
+            return 0.0
+        return float((r[finite] <= self.config.scan_self_filter_radius_m).mean())
+
+    def _compute_r_min(self) -> float:
+        valid = self._valid_scan_mask()
+        if not np.any(valid):
             return self.config.default_r_min
-        
-        return float(np.min(ranges[valid_mask]))
+        return float(np.min(self.sensor_state.scan_ranges[valid]))
     
     def _compute_r_ttc(self) -> float:
         """R_ttc: Time to collision at current velocity."""
         vx = self.sensor_state.velocity_x
-        
+
         if abs(vx) < self.config.velocity_epsilon:
             return self.config.default_r_ttc
-        
-        ranges = self.sensor_state.scan_ranges
-        r_min = self.sensor_state.scan_range_min
-        r_max = self.sensor_state.scan_range_max
-        
-        # Use pre-computed forward mask
+
         if self.cache.forward_mask is None:
             return self.config.default_r_ttc
-        
-        forward_ranges = ranges[self.cache.forward_mask]
-        valid_mask = (forward_ranges > r_min) & (forward_ranges < r_max)
-        
-        if not np.any(valid_mask):
+
+        # Forward beams that are genuine world returns (self-returns rejected).
+        valid = self._valid_scan_mask(self.cache.forward_mask)
+
+        if not np.any(valid):
             return self.config.default_r_ttc
-        
-        d_front = np.min(forward_ranges[valid_mask])
-        
+
+        d_front = float(np.min(self.sensor_state.scan_ranges[valid]))
+
         if vx > 0:
-            return min(float(d_front / vx), self.config.default_r_ttc)
-        else:
-            # Moving backward - could compute backward TTC
-            return self.config.default_r_ttc
+            return min(d_front / vx, self.config.default_r_ttc)
+        # Moving backward - could compute backward TTC
+        return self.config.default_r_ttc
     
     def _compute_r_vis(self) -> float:
-        """R_vis: Fraction of max-range or invalid beams in forward sector."""
-        if self.cache.forward_mask is None:
-            return 0.0
-        
+        fwd = self.cache.forward_mask
         ranges = self.sensor_state.scan_ranges
-        r_min = self.sensor_state.scan_range_min
-        r_max = self.sensor_state.scan_range_max
-        
-        forward_ranges = ranges[self.cache.forward_mask]
-        
-        if len(forward_ranges) == 0:
+        considered = fwd & np.isfinite(ranges) & (ranges > self.config.scan_self_filter_radius_m)
+        if self.cache.angle_keep_mask is not None:
+            considered &= self.cache.angle_keep_mask
+        n = int(considered.sum())
+        if n == 0:
             return 0.0
-        
-        # Count invalid beams (max range, below min, or NaN/inf)
-        invalid_mask = (
-            (forward_ranges >= r_max * 0.99) |
-            (forward_ranges <= r_min) |
-            ~np.isfinite(forward_ranges)
-        )
-        
-        return float(np.mean(invalid_mask))
+        # occluded = a real return short of max range blocks the view
+        occluded = considered & (ranges < 0.95 * self.sensor_state.scan_range_max)
+        return float(occluded.sum()) / n
     
     def _compute_r_dens(self) -> float:
-        """R_dens: Obstacle density in local window."""
-        if self.sensor_state.costmap is None:
-            return 0.0
-        
+        """R_dens: Obstacle density in local window.
+
+        Returns NaN (not 0.0) when the value cannot be computed, so "no data"
+        is distinguishable from "genuinely no lethal cells nearby".
+        """
         costmap = self.sensor_state.costmap
+        if costmap is None:
+            return float('nan')
+
+        # Robot position in the COSTMAP's frame — the local costmap origin is
+        # in odom, while robot_x/robot_y come from /amcl_pose in map.
+        rp = self._robot_in_costmap_frame()
+        if rp is None:
+            return float('nan')
+        rx, ry = rp
+
         resolution = self.sensor_state.costmap_resolution
         origin_x = self.sensor_state.costmap_origin_x
         origin_y = self.sensor_state.costmap_origin_y
-        
+
         # Convert robot position to costmap coordinates
-        mx = int((self.sensor_state.robot_x - origin_x) / resolution)
-        my = int((self.sensor_state.robot_y - origin_y) / resolution)
-        
+        mx = int((rx - origin_x) / resolution)
+        my = int((ry - origin_y) / resolution)
+
         # Window size in cells
         window_cells = int(self.config.density_window_radius / resolution)
-        
+
         # Extract local window with bounds checking
         h, w = costmap.shape
         x_min = max(0, mx - window_cells)
         x_max = min(w, mx + window_cells + 1)
         y_min = max(0, my - window_cells)
         y_max = min(h, my + window_cells + 1)
-        
+
         if x_min >= x_max or y_min >= y_max:
-            return 0.0
-        
+            return float('nan')
+
         local_window = costmap[y_min:y_max, x_min:x_max]
-        
+
         # Fraction of cells with lethal cost (254 in Nav2)
         return float(np.mean(local_window == 254))
     
@@ -570,67 +653,70 @@ class OptimizedRiskStateNode(Node):
         """R_width: Corridor width perpendicular to heading."""
         ranges = self.sensor_state.scan_ranges
         angles = self.sensor_state.scan_angles
-        
+
         if angles is None:
             return self.config.default_r_width
-        
-        r_min = self.sensor_state.scan_range_min
-        r_max = self.sensor_state.scan_range_max
+
         robot_yaw = self.sensor_state.robot_yaw
-        
-        # Valid ranges
-        valid_mask = (ranges > r_min) & (ranges < r_max)
-        valid_ranges = np.where(valid_mask, ranges, np.inf)
-        
+
+        # Genuine world returns; rejected beams become +inf so they cannot win
+        # a min() but the array stays full-length for positional indexing.
+        valid = self._valid_scan_mask()
+        valid_ranges = np.where(valid, ranges, np.inf)
+
         # World-frame angles
         world_angles = angles + robot_yaw
-        
+
         # Left perpendicular (robot_yaw + 90°)
         left_angle = robot_yaw + np.pi / 2
         left_diff = np.abs(np.mod(world_angles - left_angle + np.pi, 2 * np.pi) - np.pi)
         left_mask = left_diff < self.config.lateral_tolerance
         left_ranges = valid_ranges[left_mask]
-        d_left = np.min(left_ranges) if len(left_ranges) > 0 and np.any(np.isfinite(left_ranges)) else np.inf
-        
+        d_left = (np.min(left_ranges)
+                  if len(left_ranges) > 0 and np.any(np.isfinite(left_ranges))
+                  else np.inf)
+
         # Right perpendicular (robot_yaw - 90°)
         right_angle = robot_yaw - np.pi / 2
         right_diff = np.abs(np.mod(world_angles - right_angle + np.pi, 2 * np.pi) - np.pi)
         right_mask = right_diff < self.config.lateral_tolerance
         right_ranges = valid_ranges[right_mask]
-        d_right = np.min(right_ranges) if len(right_ranges) > 0 and np.any(np.isfinite(right_ranges)) else np.inf
-        
+        d_right = (np.min(right_ranges)
+                   if len(right_ranges) > 0 and np.any(np.isfinite(right_ranges))
+                   else np.inf)
+
         # Corridor width is sum of left and right clearance
         if np.isinf(d_left) and np.isinf(d_right):
             return self.config.default_r_width
-        elif np.isinf(d_left):
+        if np.isinf(d_left):
             return float(2 * d_right)
-        elif np.isinf(d_right):
+        if np.isinf(d_right):
             return float(2 * d_left)
-        else:
-            return float(d_left + d_right)
+        return float(d_left + d_right)
+        
     
     def _compute_r_clear(self) -> float:
         """R_clear: Maximum free angular sector (VFH-style)."""
         ranges = self.sensor_state.scan_ranges
-        
+
         if self.cache.sector_indices is None:
             return 0.0
-        
-        r_min = self.sensor_state.scan_range_min
-        r_max = self.sensor_state.scan_range_max
-        
+
         # Reset histogram (pre-allocated)
         histogram = self.cache.histogram
         histogram.fill(0)
-        
-        # Valid ranges
-        valid_mask = (ranges > r_min) & (ranges < r_max)
-        valid_ranges = np.where(valid_mask, ranges, np.inf)
-        
+
+        # Genuine world returns only. Self-returns become +inf and therefore
+        # never mark a sector blocked — previously the chassis kept the same
+        # sectors permanently blocked, which is why this feature had 7 distinct
+        # values across the whole smoke run.
+        valid = self._valid_scan_mask()
+        valid_ranges = np.where(valid, ranges, np.inf)
+
         # Mark blocked sectors
         blocked_mask = (valid_ranges < self.config.blocked_distance) & np.isfinite(valid_ranges)
         blocked_sectors = self.cache.sector_indices[blocked_mask]
-        
+
         if len(blocked_sectors) > 0:
             np.add.at(histogram, blocked_sectors, 1)
         
@@ -710,53 +796,68 @@ class OptimizedRiskStateNode(Node):
         self.cache.path_timestamp = self.sensor_state.path_timestamp
     
     def _compute_r_grad_cached(self) -> float:
-        """R_grad: Costmap gradient magnitude with caching."""
-        # Check if cache is valid
-        if (self.cache.gradient_magnitude is not None and
-            self.cache.gradient_costmap_timestamp == self.sensor_state.costmap_timestamp):
-            # Use cached gradient
-            pass
-        else:
-            # Recompute gradient
+        """R_grad: gradient magnitude of a fixed-inflation field over the LIVE
+        costmap's lethal cells.
+
+        Lethal (==254) cells come from the static and obstacle layers, so this
+        still responds to dynamic obstacles. The inflation used here is a fixed
+        constant of the risk definition, NOT the inflation_radius treatment, so
+        the feature does not encode C_t.
+        """
+        if (self.cache.gradient_magnitude is None or
+                self.cache.gradient_costmap_timestamp != self.sensor_state.costmap_timestamp):
             self._update_gradient_cache()
-        
+
         if self.cache.gradient_magnitude is None:
-            return 0.0
-        
-        # Lookup at robot position
-        costmap = self.sensor_state.costmap
+            return float('nan')
+
+        rp = self._robot_in_costmap_frame()
+        if rp is None:
+            return float('nan')
+        rx, ry = rp
+
         resolution = self.sensor_state.costmap_resolution
-        origin_x = self.sensor_state.costmap_origin_x
-        origin_y = self.sensor_state.costmap_origin_y
-        
-        mx = int((self.sensor_state.robot_x - origin_x) / resolution)
-        my = int((self.sensor_state.robot_y - origin_y) / resolution)
-        
+        mx = int((rx - self.sensor_state.costmap_origin_x) / resolution)
+        my = int((ry - self.sensor_state.costmap_origin_y) / resolution)
+
         h, w = self.cache.gradient_magnitude.shape
-        
         if 0 <= mx < w and 0 <= my < h:
             return float(self.cache.gradient_magnitude[my, mx])
-        
-        return 0.0
+        return float('nan')
     
     def _update_gradient_cache(self) -> None:
-        """Recompute costmap gradient (called only when costmap changes)."""
+        """Rebuild the exogenous cost field and its gradient (costmap changed)."""
         costmap = self.sensor_state.costmap
-        
-        if costmap is None:
+        if costmap is None or _ndimage is None:
             self.cache.gradient_magnitude = None
             return
-        
+
         resolution = self.sensor_state.costmap_resolution
-        
-        # Simple finite difference gradient (faster than Sobel for small costmaps)
-        grad_x = np.zeros_like(costmap)
-        grad_y = np.zeros_like(costmap)
-        
-        grad_x[:, 1:-1] = (costmap[:, 2:] - costmap[:, :-2]) / 2
-        grad_y[1:-1, :] = (costmap[2:, :] - costmap[:-2, :]) / 2
-        
-        self.cache.gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2) / resolution
+
+        # Observations only — excludes the inflation decay band (252..1) and
+        # the inscribed band (253), both of which depend on the treatment.
+        lethal = (costmap == 254)
+
+        if not lethal.any():
+            self.cache.gradient_magnitude = np.zeros_like(costmap, dtype=np.float32)
+            self.cache.gradient_costmap_timestamp = self.sensor_state.costmap_timestamp
+            return
+
+        # Distance to the nearest lethal cell, in metres.
+        d = _ndimage.distance_transform_edt(~lethal) * resolution
+
+        # Our OWN inflation — constants, never the treatment values.
+        rad = self.config.risk_inflation_radius_m      # e.g. 0.55
+        k = self.config.risk_cost_scaling_factor       # e.g. 3.0
+        cost = np.where(d <= 0.0, 254.0,
+               np.where(d >= rad, 0.0, 252.0 * np.exp(-k * d))).astype(np.float32)
+
+        grad_x = np.zeros_like(cost)
+        grad_y = np.zeros_like(cost)
+        grad_x[:, 1:-1] = (cost[:, 2:] - cost[:, :-2]) / 2.0
+        grad_y[1:-1, :] = (cost[2:, :] - cost[:-2, :]) / 2.0
+
+        self.cache.gradient_magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2) / resolution
         self.cache.gradient_costmap_timestamp = self.sensor_state.costmap_timestamp
     
     # =========================================================================
@@ -793,6 +894,17 @@ class OptimizedRiskStateNode(Node):
                 KeyValue(key='cycles_degraded', value=str(self._cycles_degraded)),
                 KeyValue(key='degradation_rate', value=f'{100*self._cycles_degraded/max(1,self._cycles_computed):.1f}%'),
                 KeyValue(key='components_last', value=','.join(components)),
+                # Health signals for the two fixes this node depends on.
+                # self_hit_fraction near 1.0 means the scan is dominated by the
+                # robot's own structure and the self-filter radius is too small.
+                # tf_failure_rate above ~0 means r_dens/r_grad are returning NaN
+                # because the costmap frame cannot be resolved.
+                KeyValue(key='self_hit_fraction',
+                         value=f'{self.self_hit_fraction():.3f}'),
+                KeyValue(key='tf_failure_rate',
+                         value=f'{self._tf_failures / max(1, self._tf_attempts):.3f}'),
+                KeyValue(key='costmap_frame',
+                         value=self.sensor_state.costmap_frame or '<none>'),
             ]
             
             # Set status level

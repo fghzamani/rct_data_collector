@@ -53,8 +53,8 @@ def parse_args():
     p.add_argument("--timeout", type=float, default=180.0)
     p.add_argument("--cooldown", type=float, default=3.0)
     p.add_argument("--clearance", type=float, default=0.5)
-    p.add_argument("--min-distance", type=float, default=3.0)
-    p.add_argument("--max-distance", type=float, default=15.0)
+    p.add_argument("--min-distance", type=float, default=10.0)
+    p.add_argument("--max-distance", type=float, default=20.0)
     p.add_argument("--config", type=str, help="YAML config file")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--visualize-only", action="store_true")
@@ -90,6 +90,41 @@ def parse_args():
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
+
+
+def _config_from_yaml(raw: dict) -> OrchestratorConfig:
+    """Build an OrchestratorConfig from a YAML dict, tolerating extra keys.
+
+    The previous code did ``OrchestratorConfig(**yaml.safe_load(f))``, which
+    raises TypeError on any key the dataclass does not declare. The shipped
+    default_config.yaml contains several such keys (pal_config_dir,
+    override_filename, nav_module_name, use_dynamic_reconfig,
+    restart_nav_module, retry_on_nav_failure, risk_feature_topics), so loading
+    it by --config could not work. Unknown keys are now reported and skipped
+    rather than aborting the run, and the nested risk_feature_topics block is
+    flattened onto the flat scan_topic/costmap fields it corresponds to.
+    """
+    import dataclasses
+
+    raw = dict(raw)
+
+    # Nested convenience block -> flat fields.
+    topics = raw.pop("risk_feature_topics", None) or {}
+    if isinstance(topics, dict):
+        if "scan" in topics and "scan_topic" not in raw:
+            raw["scan_topic"] = topics["scan"]
+        if "risk_state" in topics and "risk_topic" not in raw:
+            raw["risk_topic"] = topics["risk_state"]
+
+    known = {f.name for f in dataclasses.fields(OrchestratorConfig)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        logger.warning(
+            "Ignoring %d unrecognised config key(s): %s. They are not fields on "
+            "OrchestratorConfig — check for typos or stale settings.",
+            len(unknown), ", ".join(unknown),
+        )
+    return OrchestratorConfig(**{k: v for k, v in raw.items() if k in known})
 
 
 def main():
@@ -187,7 +222,7 @@ def main():
     # Build config
     if args.config:
         with open(args.config) as f:
-            config = OrchestratorConfig(**yaml.safe_load(f))
+            config = _config_from_yaml(yaml.safe_load(f) or {})
     else:
         config = OrchestratorConfig(
             num_trials=args.trials,
