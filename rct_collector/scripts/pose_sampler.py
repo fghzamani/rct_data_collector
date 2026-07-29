@@ -23,6 +23,60 @@ from scipy.ndimage import distance_transform_edt
 logger = logging.getLogger(__name__)
 
 
+def _parse_polygon(poly):
+    """Accept a footprint as a list of [x, y] or the string form used in the
+    footprint config (e.g. '[[-0.275, 0.0], [0.238, 0.138], ...]'). Returns an
+    (N, 2) float array, or None if not provided."""
+    if poly is None:
+        return None
+    if isinstance(poly, str):
+        import json
+        poly = json.loads(poly)
+    arr = np.asarray(poly, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 2 or len(arr) < 3:
+        raise ValueError("footprint_polygon must be >=3 [x, y] vertices")
+    return arr
+
+
+def _polygon_radii(poly: np.ndarray) -> tuple[float, float]:
+    """Inscribed and circumscribed radii about the robot origin (0, 0), which
+    is the frame the footprint is defined in and the point Nav2 rotates about.
+
+    inscribed  = min distance from origin to any edge (circle guaranteed inside)
+    circumscribed = max distance from origin to any vertex (circle guaranteed
+                    to contain the footprint at every yaw)
+    """
+    origin = np.zeros(2)
+    n = len(poly)
+    ins = np.inf
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        ab = b - a
+        denom = float(ab @ ab) or 1e-12
+        t = np.clip((origin - a) @ ab / denom, 0.0, 1.0)
+        ins = min(ins, float(np.linalg.norm(origin - (a + t * ab))))
+    circ = float(np.max(np.linalg.norm(poly, axis=1)))
+    return ins, circ
+
+
+def _points_in_poly(pts: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """Vectorised ray-casting point-in-polygon. pts (M,2), poly (N,2) -> (M,)
+    bool. Loops over the (few) polygon edges, vectorised over the many points,
+    so it needs no matplotlib and stays fast at pose-generation time."""
+    x, y = pts[:, 0], pts[:, 1]
+    inside = np.zeros(len(pts), dtype=bool)
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        cond = ((yi > y) != (yj > y)) & (
+            x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi)
+        inside ^= cond
+        j = i
+    return inside
+
+
 class PoseSampler:
     """
     Sample random robot poses from free space in an occupancy grid map.
@@ -51,9 +105,45 @@ class PoseSampler:
         max_goal_distance: float = 15.0,
         sampling_bounds: Optional[dict] = None,
         seed: int | None = None,
+        footprint_clearance_m: float = 0.0,
+        footprint_polygon=None,
+        footprint_yaw_bins: int = 72,
+        footprint_safety_margin_m: float = 0.0,
     ):
         self.map_yaml_path = Path(map_yaml_path)
         self.obstacle_clearance_m = obstacle_clearance_m
+        # Minimum clearance so that the LARGEST footprint the experiment will
+        # use (the extended "carry" arm) can physically exist at every sampled
+        # pose. Set this to the carry footprint's inscribed radius.
+        #
+        # This is a PRE-TREATMENT, purely geometric filter: it depends only on
+        # the map and the robot's physical extent, not on which arm state a
+        # trial is later assigned or on whether any planner succeeds. The SAME
+        # pool is therefore used for both arm states, which keeps arm
+        # independent of start geometry (no selection on a treatment-affected
+        # variable). Residual planning failures under carry — the arm genuinely
+        # cannot traverse a corridor — are left in on purpose: that is a real
+        # causal effect of the arm, not a sampling artefact, and must not be
+        # filtered out.
+        self.footprint_clearance_m = footprint_clearance_m
+        # Orientation-aware feasibility (Option 2). When footprint_polygon is
+        # given (the robot-frame vertices of the LARGEST / carry footprint), a
+        # candidate pose is feasible iff that polygon, placed at the pose's
+        # (x, y, yaw), does not overlap an occupied cell. This keeps poses where
+        # the arm would hit a wall at one heading but fits at another — which a
+        # single clearance circle would wrongly discard. As with the circular
+        # option, the SAME feasible pool is used for both arm states, so arm
+        # stays independent of start geometry.
+        self.footprint_polygon = _parse_polygon(footprint_polygon)
+        self.footprint_yaw_bins = int(footprint_yaw_bins)
+        self.footprint_safety_margin_m = float(footprint_safety_margin_m)
+        self._orientation_aware = self.footprint_polygon is not None
+        # Filled by load_map(): EDT field, inscribed/circumscribed radii, and
+        # one pixel-offset mask per yaw bin.
+        self._dist_field: Optional[np.ndarray] = None
+        self._r_in: float = 0.0
+        self._r_circ: float = 0.0
+        self._fp_masks: list = []
         self.min_goal_distance = min_goal_distance
         self.max_goal_distance = max_goal_distance
         self.sampling_bounds = sampling_bounds
@@ -103,6 +193,83 @@ class PoseSampler:
                 "and sampling bounds."
             )
 
+    def _precompute_footprint_masks(self):
+        """One pixel-offset mask per yaw bin: the (drow, dcol) cells the
+        footprint covers when placed at the origin cell at that yaw. Checking a
+        candidate then reduces to occupancy lookups at these offsets."""
+        poly = self.footprint_polygon
+        res = self.resolution
+        margin_px = self.footprint_safety_margin_m / res
+        self._fp_masks = []
+        for k in range(self.footprint_yaw_bins):
+            yaw = 2.0 * np.pi * k / self.footprint_yaw_bins
+            c, s = np.cos(yaw), np.sin(yaw)
+            wx = c * poly[:, 0] - s * poly[:, 1]
+            wy = s * poly[:, 0] + c * poly[:, 1]
+            # World metres -> pixel offsets. +x -> +col, +y -> -row.
+            pc = wx / res
+            pr = -wy / res
+            verts = np.column_stack([pc, pr])  # (col, row) space
+            lo_c, hi_c = np.floor(pc.min()), np.ceil(pc.max())
+            lo_r, hi_r = np.floor(pr.min()), np.ceil(pr.max())
+            cols, rows = np.meshgrid(np.arange(lo_c, hi_c + 1),
+                                     np.arange(lo_r, hi_r + 1))
+            pts = np.column_stack([cols.ravel(), rows.ravel()])
+            inside = _points_in_poly(pts, verts)
+            drow = rows.ravel()[inside].astype(int)
+            dcol = cols.ravel()[inside].astype(int)
+            if margin_px > 0 and drow.size:
+                # Dilate the mask by the safety margin (in pixels) so the
+                # footprint keeps a buffer from walls.
+                rad = int(np.ceil(margin_px))
+                offs = [(dr, dc) for dr in range(-rad, rad + 1)
+                        for dc in range(-rad, rad + 1)
+                        if dr * dr + dc * dc <= margin_px * margin_px]
+                pairs = {(int(r + dr), int(c + dc))
+                         for r, c in zip(drow, dcol) for dr, dc in offs}
+                drow = np.array([p[0] for p in pairs], int)
+                dcol = np.array([p[1] for p in pairs], int)
+            self._fp_masks.append((drow, dcol))
+
+    def _footprint_feasible(self, row: int, col: int, yaw_bin: int) -> bool:
+        """True iff the footprint at (row, col) rotated to yaw_bin does not
+        overlap an occupied cell. Uses the EDT prefilter to skip the polygon
+        test wherever the answer is already decided by clearance."""
+        dist = self._dist_field[row, col]
+        if dist >= self._r_circ:
+            return True                    # fits at every yaw
+        if dist < self._r_in:
+            return False                   # base overlaps at every yaw
+        drow, dcol = self._fp_masks[yaw_bin % self.footprint_yaw_bins]
+        rr = row + drow
+        cc = col + dcol
+        H, W = self.map_image.shape
+        if rr.min() < 0 or rr.max() >= H or cc.min() < 0 or cc.max() >= W:
+            return False                   # footprint would leave the map
+        return not bool(np.any(self.map_image[rr, cc] <= self.OCCUPIED_THRESHOLD))
+
+    def _sample_feasible_pose(self, max_tries: int = 400):
+        """Draw a (row, col, yaw) whose footprint fits. Rejection is over the
+        JOINT (cell, yaw), so the result is uniform over feasible poses — cells
+        with few feasible headings contribute proportionally less, which is the
+        correct pre-treatment pose distribution."""
+        for _ in range(max_tries):
+            idx = self.rng.integers(len(self.valid_indices))
+            row, col = self.valid_indices[idx]
+            if not self._orientation_aware:
+                yaw = float(self.rng.uniform(-np.pi, np.pi))
+                return int(row), int(col), yaw
+            yaw_bin = int(self.rng.integers(self.footprint_yaw_bins))
+            if self._footprint_feasible(int(row), int(col), yaw_bin):
+                # Store the exact yaw that was checked (bin centre).
+                yaw = 2.0 * np.pi * yaw_bin / self.footprint_yaw_bins
+                yaw = (yaw + np.pi) % (2 * np.pi) - np.pi  # wrap to (-pi, pi]
+                return int(row), int(col), float(yaw)
+        raise RuntimeError(
+            "Could not sample a footprint-feasible pose. The carry footprint "
+            "may be too large for this map — check the visualisation, widen the "
+            "map, or reduce footprint_safety_margin_m.")
+
     def _build_valid_mask(self):
         """
         Build a boolean mask of cells where the robot can be placed.
@@ -120,10 +287,30 @@ class PoseSampler:
         # Distance transform: distance of each cell to nearest occupied cell
         # Note: EDT operates on binary image where True = "background" (non-obstacle)
         dist_from_obstacles = distance_transform_edt(~occupied) * self.resolution
+        self._dist_field = dist_from_obstacles  # cached for footprint checks
 
-        # Valid = free AND far enough from obstacles
-        clearance_cells = self.obstacle_clearance_m
-        self.valid_mask = free & (dist_from_obstacles >= clearance_cells)
+        if self._orientation_aware:
+            # Feasibility is decided per (cell, yaw) by the footprint polygon,
+            # not by a single clearance circle. The valid mask here is the set
+            # of cells that COULD host the footprint at some yaw: those whose
+            # clearance is at least the inscribed radius (below it, even the
+            # base overlaps, so no yaw works). Cells at or above the
+            # circumscribed radius fit at every yaw. The band in between is
+            # resolved by the per-yaw mask at sampling time.
+            self._r_in, self._r_circ = _polygon_radii(self.footprint_polygon)
+            self._r_in += self.footprint_safety_margin_m
+            self._r_circ += self.footprint_safety_margin_m
+            self._precompute_footprint_masks()
+            self.valid_mask = free & (dist_from_obstacles >= self._r_in)
+        else:
+            # Valid = free AND far enough from obstacles. The required clearance
+            # is the larger of the sampling clearance and the carry-footprint
+            # radius, so every sampled pose admits the largest footprint the
+            # experiment uses. Using one pool for both arm states keeps
+            # arm ⟂ start geometry.
+            clearance_cells = max(self.obstacle_clearance_m,
+                                  self.footprint_clearance_m)
+            self.valid_mask = free & (dist_from_obstacles >= clearance_cells)
 
         # Apply optional spatial bounds
         if self.sampling_bounds:
@@ -132,6 +319,21 @@ class PoseSampler:
 
         # Cache valid cell indices for fast sampling
         self.valid_indices = np.argwhere(self.valid_mask)  # (N, 2) array of [row, col]
+
+        if self._orientation_aware:
+            band = (self._dist_field >= self._r_in) & (self._dist_field < self._r_circ) & free
+            auto = (self._dist_field >= self._r_circ) & free
+            logger.info(
+                f"Orientation-aware pose pool: footprint inscribed={self._r_in:.3f} m, "
+                f"circumscribed={self._r_circ:.3f} m. "
+                f"{int(auto.sum())} cells fit at every yaw, "
+                f"{int(band.sum())} cells need the per-yaw test, "
+                f"rest excluded. Same pool is used for BOTH arm states.")
+        elif self.footprint_clearance_m > self.obstacle_clearance_m:
+            eff = max(self.obstacle_clearance_m, self.footprint_clearance_m)
+            logger.info(
+                f"Pose pool built with footprint clearance {eff:.2f} m "
+                f"(carry-feasible); this same pool is used for BOTH arm states.")
 
     def _make_bounds_mask(self) -> np.ndarray:
         """Create a mask from user-specified world-coordinate bounds."""
@@ -178,25 +380,20 @@ class PoseSampler:
             RuntimeError if no valid pair found within max_attempts
         """
         for attempt in range(max_attempts):
-            # Sample start pose
-            start_idx = self.rng.integers(len(self.valid_indices))
-            start_row, start_col = self.valid_indices[start_idx]
+            # Feasible start (footprint fits at its yaw, when orientation-aware).
+            start_row, start_col, start_yaw = self._sample_feasible_pose()
             start_x, start_y = self._pixel_to_world(start_row, start_col)
 
-            # Sample goal pose with distance constraint
-            goal_idx = self.rng.integers(len(self.valid_indices))
-            goal_row, goal_col = self.valid_indices[goal_idx]
+            # Feasible goal with the distance constraint.
+            goal_row, goal_col, goal_yaw = self._sample_feasible_pose()
             goal_x, goal_y = self._pixel_to_world(goal_row, goal_col)
 
             dist = np.sqrt((goal_x - start_x) ** 2 + (goal_y - start_y) ** 2)
 
             if self.min_goal_distance <= dist <= self.max_goal_distance:
-                start_yaw = float(self.rng.uniform(-np.pi, np.pi))
-                goal_yaw = float(self.rng.uniform(-np.pi, np.pi))
-
                 return (
-                    {"x": float(start_x), "y": float(start_y), "yaw": start_yaw},
-                    {"x": float(goal_x), "y": float(goal_y), "yaw": goal_yaw},
+                    {"x": float(start_x), "y": float(start_y), "yaw": float(start_yaw)},
+                    {"x": float(goal_x), "y": float(goal_y), "yaw": float(goal_yaw)},
                 )
 
         raise RuntimeError(

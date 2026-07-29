@@ -29,6 +29,17 @@ min_goal_distance: 10.0         # Min Euclidean distance between start and goal 
 max_goal_distance: 20.0
 obstacle_clearance_m: 0.35      # Min distance from any obstacle for sampled poses
 
+# Inscribed radius of the LARGEST (carry) footprint, in metres. When > 0, the
+# pose pool only includes starts/goals where the carry footprint physically
+# fits, and that SAME pool is used for both arm states. This removes the
+# selection bias in which carry trials planning-fail at start and get dropped
+# at a treatment-dependent rate — arm becomes independent of start geometry.
+# It does NOT remove carry trials that fail to traverse a tight corridor
+# mid-mission; those are a real causal effect of the arm and are kept.
+# Get the value from measure_footprint.py (inscribed_radius of the carry poly).
+# Leave at 0.0 for legacy behaviour (obstacle_clearance only).
+footprint_clearance_m: 0.0
+
 # Optional: restrict sampling to a subregion of the map (world coordinates)
 # sampling_bounds:
 #   x_min: -5.0

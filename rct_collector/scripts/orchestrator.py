@@ -55,6 +55,18 @@ class OrchestratorConfig:
     min_goal_distance: float = 3.0
     max_goal_distance: float = 15.0
     obstacle_clearance_m: float = 0.5
+    # Inscribed radius of the largest (carry) footprint. When set, the pose
+    # pool only contains starts/goals where the carry footprint physically
+    # fits, and the SAME pool is used for both arm states so that arm remains
+    # independent of start geometry. 0.0 disables (legacy behaviour).
+    footprint_clearance_m: float = 0.0
+    # Carry footprint polygon (robot frame) as a list or '[[x,y],...]' string.
+    # When set, the pose pool is built orientation-aware: the footprint must fit
+    # at each sampled yaw. This is the precise version of footprint_clearance_m
+    # and supersedes it. The same pool is used for both arm states.
+    footprint_polygon: Optional[object] = None
+    footprint_yaw_bins: int = 72
+    footprint_safety_margin_m: float = 0.0
     sampling_bounds: Optional[dict] = None
 
     output_dir: str = "./rct_data"
@@ -217,6 +229,10 @@ class RCTOrchestrator:
             max_goal_distance=self.config.max_goal_distance,
             sampling_bounds=self.config.sampling_bounds,
             seed=self.config.seed,
+            footprint_clearance_m=self.config.footprint_clearance_m,
+            footprint_polygon=self.config.footprint_polygon,
+            footprint_yaw_bins=self.config.footprint_yaw_bins,
+            footprint_safety_margin_m=self.config.footprint_safety_margin_m,
         )
         self.pose_sampler.load_map()
 

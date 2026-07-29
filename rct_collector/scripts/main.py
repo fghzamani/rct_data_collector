@@ -53,6 +53,19 @@ def parse_args():
     p.add_argument("--timeout", type=float, default=180.0)
     p.add_argument("--cooldown", type=float, default=3.0)
     p.add_argument("--clearance", type=float, default=0.5)
+    p.add_argument("--footprint-clearance", type=float, default=0.0,
+                   help="inscribed radius of the largest (carry) footprint; "
+                        "when >0 the pose pool is carry-feasible and shared "
+                        "across both arm states (simple circular check)")
+    p.add_argument("--carry-footprint", type=str, default=None,
+                   help="carry footprint polygon as a '[[x,y],...]' string "
+                        "(robot frame). When set, poses are checked "
+                        "orientation-aware: the footprint must fit at the "
+                        "sampled yaw. Supersedes --footprint-clearance.")
+    p.add_argument("--footprint-yaw-bins", type=int, default=72,
+                   help="yaw discretisation for the orientation-aware check")
+    p.add_argument("--footprint-margin", type=float, default=0.0,
+                   help="extra safety margin (m) added around the footprint")
     p.add_argument("--min-distance", type=float, default=10.0)
     p.add_argument("--max-distance", type=float, default=20.0)
     p.add_argument("--config", type=str, help="YAML config file")
@@ -186,6 +199,10 @@ def main():
             min_goal_distance=args.min_distance,
             max_goal_distance=args.max_distance,
             seed=args.seed,
+            footprint_clearance_m=args.footprint_clearance,
+            footprint_polygon=args.carry_footprint,
+            footprint_yaw_bins=args.footprint_yaw_bins,
+            footprint_safety_margin_m=args.footprint_margin,
         )
         sampler.load_map()
         os.makedirs(args.output, exist_ok=True)
@@ -230,6 +247,7 @@ def main():
             cooldown_sec=args.cooldown,
             map_yaml_path=args.map or "",
             obstacle_clearance_m=args.clearance,
+            footprint_clearance_m=args.footprint_clearance,
             min_goal_distance=args.min_distance,
             max_goal_distance=args.max_distance,
             output_dir=args.output,

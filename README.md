@@ -43,7 +43,7 @@ If you use your own world file, add **both** plugins as direct children of `<wor
 ```
 
 ## generate presampled poses randomly
-python3 main.py --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml --visualize     --presampled-poses /home/forough/phd_projects/online_tuner/src/rct_data_collector/rct_data/presampled_poses.json --generate-poses 100 
+python3 main.py --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml --presampled-poses /home/forough/phd_projects/online_tuner/src/rct_data_collector/rct_data/presampled_poses.json --generate-poses 100 
 
 
 
