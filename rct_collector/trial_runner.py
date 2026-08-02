@@ -1155,7 +1155,7 @@ class TrialRunner:
             return result
 
         global_path_data, result.initial_global_path_length_m, result.min_global_obstacle_distance = \
-            self._analyze_global_path(initial_path, checker, costmap)
+            self._analyze_global_path(initial_path, checker, costmap, computed_at=time.time())
 
         # 4. Follow the smoothed path while recording.
         # smoothed = self._navigator.smoothPath(path) or path
@@ -1712,7 +1712,8 @@ class TrialRunner:
     def _analyze_replan(self, ev: dict, checker, costmap) -> dict:
         """Analyze one buffered /plan message. Called AFTER navigation ends."""
         path_msg = ev["path_msg"]
-        _, path_len, min_dist = self._analyze_global_path(path_msg, checker, costmap)
+        _, path_len, min_dist = self._analyze_global_path(
+            path_msg, checker, costmap, computed_at=ev["timestamp"])
         return {
             "timestamp": ev["timestamp"],
             "path_length_m": path_len,
@@ -1720,8 +1721,16 @@ class TrialRunner:
             "num_poses": len(path_msg.poses),
         }
 
-    def _analyze_global_path(self, path, checker, costmap):
-        """Return (per-pose list, total length, min obstacle distance)."""
+    def _analyze_global_path(self, path, checker, costmap, computed_at: float):
+        """Return (per-pose list, total length, min obstacle distance).
+
+        A planned path is computed atomically, not traversed over time, so
+        every pose in it shares the same ``timestamp``: the wall-clock time
+        the plan was produced (``computed_at``). That is deliberately the
+        same epoch base as ``path_with_controller`` / ``risk_state_history``
+        timestamps, so all three streams can be aligned on one time axis —
+        it is NOT the time the robot was actually at that pose.
+        """
         data = []
         total_len = 0.0
         min_dist = float("inf")
@@ -1756,6 +1765,7 @@ class TrialRunner:
             prev = (x, y)
 
             data.append({
+                "timestamp": computed_at,
                 "pose": [x, y, orientation],
                 "footprint_cost": float(footprint_cost),
                 "min_dist_to_obstacle": pose_min_dist,
