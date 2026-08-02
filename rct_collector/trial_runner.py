@@ -1138,11 +1138,6 @@ class TrialRunner:
         footprint = self._resolve_footprint(params)
         rec.set_static_obstacles(self._get_static_obstacles())  # base_link→obstacle (map)
         checker, costmap = self._build_footprint_checker(footprint)
-        collision_distance = self.collision_threshold
-        if checker is not None:
-            collision_distance = checker.geometry.inscribed_radius + self.collision_margin
-            print (f"  Footprint inscribed radius ============= {checker.geometry.inscribed_radius:.3f} m, ")
-            print (f"  collision distance threshold =========== {collision_distance:.3f} m")
 
         # 3. Plan + analyse the global path.
         goal_stamped = self._make_pose_stamped(goal_pose)
@@ -1166,7 +1161,7 @@ class TrialRunner:
         # smoothed = self._navigator.smoothPath(path) or path
         # self._navigator.followPath(smoothed)
         self._navigator.goToPose(goal_stamped, behavior_tree=self.bt_xml_path)
-        self._record_navigation(rec, checker, collision_distance, result, checker, costmap)
+        self._record_navigation(rec, checker, result, checker, costmap)
 
         # 5. Classify outcome.
         #
@@ -1393,64 +1388,8 @@ class TrialRunner:
         finally:
             if rclpy.ok():
                 rclpy.shutdown()
-
-    # ── navigation recording loop ──
-    # def _record_navigation(self, rec: TrialRunnerNode, checker, collision_distance: float,
-    #                        result: TrialResult):
-    #     t_start = time.time()
-    #     last_record = t_start
-    #     prev_pose = [rec.robot_x, rec.robot_y]
-    #     local_len = 0.0
-
-    #     while not self._navigator.isTaskComplete():
-    #         rclpy.spin_once(rec, timeout_sec=0.05)
-    #         now = time.time()
-    #         elapsed = now - t_start
-
-    #         footprint_cost = 0.0
-    #         if checker is not None:
-    #             footprint_cost = checker.footprintCostAtPose(
-    #                 rec.robot_x, rec.robot_y, rec.robot_yaw)
-
-    #         # Record at the target rate (not every loop iteration).
-    #         if now - last_record >= self.record_period:
-    #             rec.record_sample(footprint_cost)
-    #             last_record = now
-    #             local_len += math.hypot(rec.robot_x - prev_pose[0], rec.robot_y - prev_pose[1])
-    #             prev_pose = [rec.robot_x, rec.robot_y]
-
-    #         # Collision: footprint in lethal cell AND LiDAR confirms proximity.
-    #         # (Fallback to LiDAR-only when no checker/costmap is available.)
-    #         # hit = False
-    #         # if checker is not None:
-    #         #     hit = (footprint_cost >= INSCRIBED_INFLATED_OBSTACLE
-    #         #            and rec.min_scan_value is not None
-    #         #            and rec.min_scan_value < collision_distance)
-    #         # elif rec.min_scan_value is not None:
-    #         #     hit = rec.min_scan_value < self.collision_threshold
-    #         if self._recorder.is_collided:
-    #             rec.record_sample(footprint_cost)
-    #             self._navigator.cancelTask()
-    #             result.collision = True
-    #             logger.warning(
-    #                 f"  COLLISION: footprint_cost={footprint_cost:.0f}, "
-    #                 f"min_scan={rec.min_scan_value:.3f}m < {collision_distance:.3f}m")
-    #             break
-
-    #         # Timeout guard.
-    #         if elapsed > self.timeout_sec:
-    #             self._navigator.cancelTask()
-    #             result.status = "TIMEOUT"
-    #             logger.warning(f"  Trial timed out after {elapsed:.1f}s")
-    #             break
-
-    #     result.travel_time_sec = time.time() - t_start
-    #     result.path_length_m = local_len
-    #     result.num_controller_samples = len(rec.controller_path)
-    #     result.num_risk_samples = len(rec.risk_state_history)
     
-    def _record_navigation(self, rec: TrialRunnerNode, checker, collision_distance: float,
-                           result: TrialResult, footprint_checker=None, costmap=None):
+    def _record_navigation(self, rec: TrialRunnerNode, checker, result: TrialResult, footprint_checker=None, costmap=None):
         rec._recording = True
         t_start = time.time()
         result.t_nav_start = t_start

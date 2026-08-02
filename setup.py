@@ -36,7 +36,9 @@ setup(
             #   ros2 run rct_collector risk_state_node
             "risk_state_node = rct_collector.environment_risk_node:main",
             # Standalone footprint measurement utility; run it once per arm pose    
-            "measure_footprint = rct_collector.measure_footprint:main"
+            "measure_footprint = rct_collector.measure_footprint:main",
+            # Interactive web visualizer tool for trial motion and recorded JSON data
+            "rct_visualize = rct_collector.scripts.visualizer:main"
         ],
     },
 )
