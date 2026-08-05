@@ -205,6 +205,51 @@ class PoseSampler:
             f"max={self.max_goal_distance}) vs map size."
         )
 
+    def sample_probe_pose(
+        self, forward_distance_m: float, max_attempts: int = 1000
+    ) -> tuple[dict, dict]:
+        """
+        Sample a single feasible pose for a Campaign A decision-point probe.
+
+        Unlike sample_start_goal() (a start/goal PAIR under a min/max distance
+        constraint, for full missions), a probe only needs one feasible pose:
+        the "goal" returned here is just `forward_distance_m` straight ahead of
+        the sampled pose along its own heading, used to give Nav2 a short local
+        drive target. Both points are re-sampled together if the forward point
+        falls outside the same clearance-guarded valid_mask sample_start_goal()
+        uses, so the footprint-feasibility guard stays active for probe goals
+        too, not just probe starts.
+
+        Returns:
+            (start, goal) dicts, each with keys x, y, yaw — same shape as
+            sample_start_goal(), so a probe pool is drop-in compatible with the
+            existing presampled-pose-pool loading/assignment machinery.
+        """
+        for _ in range(max_attempts):
+            idx = self.rng.integers(len(self.valid_indices))
+            row, col = self.valid_indices[idx]
+            x, y = self._pixel_to_world(row, col)
+            yaw = float(self.rng.uniform(-np.pi, np.pi))
+
+            goal_x = x + forward_distance_m * np.cos(yaw)
+            goal_y = y + forward_distance_m * np.sin(yaw)
+            g_row, g_col = self._world_to_pixel(goal_x, goal_y)
+
+            in_bounds = (0 <= g_row < self.valid_mask.shape[0]
+                         and 0 <= g_col < self.valid_mask.shape[1])
+            if in_bounds and self.valid_mask[g_row, g_col]:
+                return (
+                    {"x": float(x), "y": float(y), "yaw": yaw},
+                    {"x": float(goal_x), "y": float(goal_y), "yaw": yaw},
+                )
+
+        raise RuntimeError(
+            f"Could not find a feasible probe pose (forward_distance_m="
+            f"{forward_distance_m}) in {max_attempts} attempts. The forward "
+            f"point keeps landing outside the clearance-guarded free space — "
+            f"try a smaller forward_distance_m or check obstacle_clearance_m."
+        )
+
     def generate_and_save(
         self,
         n_poses: int,

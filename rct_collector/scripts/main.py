@@ -89,6 +89,40 @@ def parse_args():
     p.add_argument("--collision-threshold", type=float, default=0.15)
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--seed", type=int, default=None)
+
+    # --- Campaign A: decision-point collision probes -----------------------
+    p.add_argument("--campaign", choices=["A", "B"], default="B",
+                   help="B (default): full point-to-point missions, unchanged. "
+                        "A: short decision-point collision probes producing "
+                        "(c, R, Y^H) rows — see README.")
+    p.add_argument("--n-probes", type=int, default=500,
+                   help="Number of Campaign A probes to run (only used with "
+                        "--campaign A; maps onto the same trial-count field "
+                        "--trials uses for Campaign B)")
+    p.add_argument("--horizon-sec", type=float, default=3.0,
+                   help="Campaign A: seconds to watch for a collision after "
+                        "do(C=c) is applied")
+    p.add_argument("--baseline-settle-sec", type=float, default=2.0,
+                   help="Campaign A: seconds to drive under the (captured) "
+                        "baseline config before snapshotting R")
+    p.add_argument("--washout-sec", type=float, default=2.0,
+                   help="Campaign A: pause after reverting to baseline, "
+                        "before the next probe")
+    p.add_argument("--probe-goal-distance", type=float, default=2.5,
+                   help="Campaign A: distance (m) of the short local goToPose "
+                        "goal, straight ahead of each probe's start pose")
+    p.add_argument("--no-randomize-arm", dest="randomize_arm",
+                   action="store_false", default=True,
+                   help="Campaign A: hold the arm at the baseline's captured "
+                        "label for every probe's c, instead of randomizing "
+                        "carry/tucked (default: randomize)")
+    p.add_argument("--baseline-nudge", action="store_true", default=False,
+                   help="Campaign A: publish a short forward cmd_vel burst "
+                        "under baseline before the R snapshot. Off by default "
+                        "— under the active-drive probe design the robot is "
+                        "already moving via MPPI during baseline-settle-sec, "
+                        "so R should be non-degenerate without it; this is a "
+                        "documented escape hatch, not the primary mechanism.")
     return p.parse_args()
 
 
@@ -224,8 +258,19 @@ def main():
         with open(args.config) as f:
             config = _config_from_yaml(yaml.safe_load(f) or {})
     else:
+        # --n-probes maps onto the same num_trials field --trials uses for
+        # Campaign B, so run()'s loop bound needs no campaign-specific
+        # bookkeeping — just a different CLI flag name for clarity.
+        num_trials = args.n_probes if args.campaign == "A" else args.trials
         config = OrchestratorConfig(
-            num_trials=args.trials,
+            campaign=args.campaign,
+            num_trials=num_trials,
+            horizon_sec=args.horizon_sec,
+            baseline_settle_sec=args.baseline_settle_sec,
+            washout_sec=args.washout_sec,
+            probe_forward_distance_m=args.probe_goal_distance,
+            randomize_arm=args.randomize_arm,
+            baseline_nudge=args.baseline_nudge,
             trial_timeout_sec=args.timeout,
             cooldown_sec=args.cooldown,
             map_yaml_path=args.map or "",
