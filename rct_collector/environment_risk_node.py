@@ -105,6 +105,7 @@ class RiskStateConfig:
     scan_angle_mask_deg: tuple = ()     # flat [lo1,hi1,lo2,hi2,...] in LASER frame
     risk_inflation_radius_m: float = 0.3   # FIXED — must not track the treatment
     risk_cost_scaling_factor: float = 10.0
+    v_ref: float = 1.0                  # Reference velocity (m/s) for deconfounded TTC
 
 @dataclass 
 class SensorState:
@@ -317,6 +318,7 @@ class OptimizedRiskStateNode(Node):
         # the experiment config and report them in the paper.
         self.declare_parameter('risk_inflation_radius_m', 0.30)
         self.declare_parameter('risk_cost_scaling_factor', 10.0)
+        self.declare_parameter('v_ref', 1.0)
     
     
     def _load_config(self) -> RiskStateConfig:
@@ -333,6 +335,7 @@ class OptimizedRiskStateNode(Node):
             scan_angle_mask_deg=tuple(self.get_parameter('scan_angle_mask_deg').value or ()),
             risk_inflation_radius_m=self.get_parameter('risk_inflation_radius_m').value,
             risk_cost_scaling_factor=self.get_parameter('risk_cost_scaling_factor').value,
+            v_ref=self.get_parameter('v_ref').value,
         )
     
     # =========================================================================
@@ -571,12 +574,11 @@ class OptimizedRiskStateNode(Node):
         return float(np.min(self.sensor_state.scan_ranges[valid]))
     
     def _compute_r_ttc(self) -> float:
-        """R_ttc: Time to collision at current velocity."""
-        vx = self.sensor_state.velocity_x
-
-        if abs(vx) < self.config.velocity_epsilon:
-            return self.config.default_r_ttc
-
+        """R_ttc: Reference time to collision (d_front / v_ref).
+        
+        Uses fixed reference speed v_ref (1.0 m/s) rather than live velocity vx
+        to keep R_ttc deconfounded from treatment C^v.
+        """
         if self.cache.forward_mask is None:
             return self.config.default_r_ttc
 
@@ -587,11 +589,9 @@ class OptimizedRiskStateNode(Node):
             return self.config.default_r_ttc
 
         d_front = float(np.min(self.sensor_state.scan_ranges[valid]))
+        v_ref = self.config.v_ref if self.config.v_ref > 0 else 1.0
 
-        if vx > 0:
-            return min(d_front / vx, self.config.default_r_ttc)
-        # Moving backward - could compute backward TTC
-        return self.config.default_r_ttc
+        return min(d_front / v_ref, self.config.default_r_ttc)
     
     def _compute_r_vis(self) -> float:
         fwd = self.cache.forward_mask
