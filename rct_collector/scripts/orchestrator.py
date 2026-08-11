@@ -815,6 +815,10 @@ class RCTOrchestrator:
             "localization_error_m": result.localization_error_m,
             "collision_msgs_seen": result.collision_msgs_seen,
             "collision_channel_silent": result.collision_channel_silent,
+            "probe_progress_m": result.probe_progress_m,
+            "probe_stalled": result.probe_stalled,
+            "planned_local_path": self.trial_runner.get_probe_planned_path(),
+            "executed_trajectory": self.trial_runner.get_probe_controller_path(),
         }
         result.json_path = self.trial_runner.write_probe_json(payload, probe_id)
 

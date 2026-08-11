@@ -53,7 +53,7 @@ ros2 run rct_collector rct_collect \
   --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml \
   --campaign A --n-probes 500 \
   --horizon-sec 3.0 --baseline-settle-sec 2.0 --washout-sec 2.0 \
-  --output ./rct_data_campaign_a --collect-risk --seed 42 --move-arm
+  --output ./rct_data_campaign_a --collect-risk --seed 42 --move-arm --presampled-poses /home/forough/phd_projects/online_tuner/src/rct_data_collector/rct_data/presampled_poses.json
 ```
 
 `--no-randomize-arm` holds the arm at the baseline's captured label for every

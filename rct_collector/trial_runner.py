@@ -1099,7 +1099,13 @@ class TrialRunner:
 
         self._navigator = BasicNavigator()
         logger.info("Waiting for Nav2 to become active...")
-        self._navigator.waitUntilNav2Active()
+        try:
+            self._navigator.waitUntilNav2Active(localizer='amcl')
+        except Exception:
+            try:
+                self._navigator.waitUntilNav2Active(localizer='slam_toolbox')
+            except Exception as e:
+                logger.warning(f"Nav2 active check fallback: {e}")
         logger.info("Nav2 active ✓")
 
         self._costmap_cli = self._navigator.create_client(
@@ -1225,6 +1231,7 @@ class TrialRunner:
         """
         rec = self._recorder
         rec.reset()
+        rec._recording = True
 
         teleport_ok = self._teleport_robot(start_pose)
         time.sleep(1.0)  # let physics settle, same as run_trial()
@@ -1295,6 +1302,7 @@ class TrialRunner:
         probe's Y^H.
         """
         self._recorder.reset()
+        self._recorder._recording = True
 
     def watch_probe_collision(self, horizon_sec: float) -> tuple:
         """Poll for a Gazebo collision for `horizon_sec` starting now.
@@ -1307,20 +1315,43 @@ class TrialRunner:
         """
         rec = self._recorder
         t0 = rec.now_sec()
+        record_period = 0.1  # 10 Hz trajectory sampling
+        last_record = t0
+        rec.record_sample(0.0)
         while rec.now_sec() - t0 < horizon_sec:
+            now = rec.now_sec()
+            if now - last_record >= record_period:
+                rec.record_sample(0.0)
+                last_record = now
             if rec.is_collided:
+                rec.record_sample(0.0)
                 return 1, rec.now_sec() - t0
             time.sleep(0.01)
+        rec.record_sample(0.0)
         return 0, None
 
     def stop_probe_drive(self) -> None:
         """Cancel the in-flight goToPose() action started by
         start_probe_drive(). Campaign A step 6/7."""
         self._navigator.cancelTask()
+        self._recorder._recording = False
 
     def get_current_pose(self) -> tuple[float, float, float]:
         """Return current ground-truth pose (x, y, yaw) from the recorder."""
         return self._recorder.pose()
+
+    def get_probe_controller_path(self) -> list[dict]:
+        """Return the executed time-series trajectory samples recorded during the probe."""
+        return list(self._recorder.controller_path)
+
+    def get_probe_planned_path(self) -> list:
+        """Return the latest planned path waypoints [[x, y, yaw], ...] received from Nav2."""
+        if self._recorder.replan_events:
+            last_event = self._recorder.replan_events[-1]
+            poses = last_event.get("poses")
+            if poses is not None and len(poses) > 0:
+                return poses.tolist()
+        return []
 
     def get_collision_channel_status(self) -> tuple:
         """(collision_msgs_seen, collision_channel_silent) since the last
