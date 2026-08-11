@@ -143,7 +143,7 @@ move_arm: false
 arm_control_mode: "joint_trajectory"
 arm_action: "/arm_controller/follow_joint_trajectory"
 play_motion_action: "/play_motion2"
-arm_move_time_sec: 4.0
+arm_move_time_sec: 0.5
 arm_move_on_change_only: true
 # The footprint parameter is only a PROXY for the physical arm pose. Confirm the
 # arm actually arrived by comparing /joint_states against the ARM_CONFIGS

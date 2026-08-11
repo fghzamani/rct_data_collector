@@ -33,3 +33,5 @@ plots/
 .pydevproject
 .settings/
 .DS_Store
+
+**/rct_data_campaign_a
