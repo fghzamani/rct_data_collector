@@ -1207,8 +1207,9 @@ class RCTOrchestrator:
                 w.writeheader()
                 w.writerow(row)
         else:
-            with open(csv_path, "r") as f:
-                reader = csv.DictReader(f)
+            with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+                clean_lines = (line.replace('\x00', '') for line in f)
+                reader = csv.DictReader(clean_lines)
                 headers = reader.fieldnames
                 new_keys = set(row.keys()) - set(headers)
                 if new_keys:
@@ -1261,8 +1262,9 @@ class RCTOrchestrator:
         csv_path = os.path.join(self.config.output_dir, self.config.results_csv)
         rows: list[dict] = []
         if os.path.exists(csv_path):
-            with open(csv_path, newline="") as f:
-                rows = list(csv.DictReader(f))
+            with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+                clean_lines = (line.replace('\x00', '') for line in f)
+                rows = list(csv.DictReader(clean_lines))
 
         def n(pred) -> int:
             return sum(1 for r in rows if pred(r))
