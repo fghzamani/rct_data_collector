@@ -378,6 +378,8 @@ class TrialResult:
     washout_sec: float = 0.0
     probe_goal_pose: dict = field(default_factory=dict)     # the short local goToPose target
     baseline_valid: int = 1                  # 1 iff the baseline re-assert applied cleanly this probe
+    probe_progress_m: Optional[float] = None # physical distance traveled during horizon_sec
+    probe_stalled: Optional[int] = None    # 1 if robot moved < 0.1m without collision (frozen/stuck)
 
     def _score_outcomes(self) -> None:
         """Fill the dual-outcome fields from the errors already measured.
@@ -539,6 +541,9 @@ class TrialResult:
             d["y_h"] = _b(self.y_h)
             d["collision_time_sec"] = (
                 "" if self.collision_time_sec is None else self.collision_time_sec)
+            d["probe_progress_m"] = (
+                "" if self.probe_progress_m is None else round(self.probe_progress_m, 3))
+            d["probe_stalled"] = _b(self.probe_stalled)
             d["r_snapshot_time"] = self.r_snapshot_time
             d["c_apply_time"] = self.c_apply_time
             d["horizon_sec"] = self.horizon_sec
@@ -940,9 +945,23 @@ class TrialRunnerNode(Node):
         if not self.joint_positions:
             return None
         if max_age_sec is not None and self.joint_states_stamp > 0:
-            if (time.time() - self.joint_states_stamp) > max_age_sec:
+            if (self.now_sec() - self.joint_states_stamp) > max_age_sec:
                 return None
         return {n: self.joint_positions[n] for n in names if n in self.joint_positions}
+
+    def now_sec(self) -> float:
+        """ROS / simulation clock time in seconds.
+        
+        Using ROS clock ensures time metrics (horizon, timeouts, travel time)
+        are tied to Gazebo simulation clock rather than host wall-clock time.
+        """
+        try:
+            nanos = self.get_clock().now().nanoseconds
+            if nanos > 0:
+                return nanos / 1e9
+        except Exception:
+            pass
+        return time.time()
 
 
 # ── Trial runner ──────────────────────────────────────────────────────────────
@@ -952,6 +971,12 @@ class TrialRunner:
 
     rclpy and the BasicNavigator are created once; run_trial() reuses them.
     """
+
+    def now_sec(self) -> float:
+        """ROS / simulation clock time in seconds."""
+        if hasattr(self, "_recorder") and self._recorder is not None:
+            return self._recorder.now_sec()
+        return time.time()
 
     def __init__(
         self,
@@ -1281,10 +1306,10 @@ class TrialRunner:
         call; y_h=0 with collision_time_sec=None if the window elapses clean.
         """
         rec = self._recorder
-        t0 = time.time()
-        while time.time() - t0 < horizon_sec:
+        t0 = rec.now_sec()
+        while rec.now_sec() - t0 < horizon_sec:
             if rec.is_collided:
-                return 1, time.time() - t0
+                return 1, rec.now_sec() - t0
             time.sleep(0.01)
         return 0, None
 
@@ -1292,6 +1317,10 @@ class TrialRunner:
         """Cancel the in-flight goToPose() action started by
         start_probe_drive(). Campaign A step 6/7."""
         self._navigator.cancelTask()
+
+    def get_current_pose(self) -> tuple[float, float, float]:
+        """Return current ground-truth pose (x, y, yaw) from the recorder."""
+        return self._recorder.pose()
 
     def get_collision_channel_status(self) -> tuple:
         """(collision_msgs_seen, collision_channel_silent) since the last

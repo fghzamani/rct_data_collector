@@ -146,7 +146,7 @@ class OrchestratorConfig:
     arm_control_mode: str = "joint_trajectory"  # default mode; per-pose "mode" overrides
     arm_action: str = "/arm_controller/follow_joint_trajectory"
     play_motion_action: str = "/play_motion2"
-    arm_move_time_sec: float = 4.0
+    arm_move_time_sec: float = 1.0
     arm_move_on_change_only: bool = True  # only re-move the arm when the label changes
     # Confirm the arm physically arrived by comparing /joint_states against the
     # ARM_CONFIGS joint targets. An action reporting SUCCEEDED is not proof.
@@ -703,7 +703,7 @@ class RCTOrchestrator:
 
         # 4. Snapshot R — the frozen pre-treatment state.
         result.risk_state_snapshot = self.trial_runner.get_risk_snapshot()
-        result.r_snapshot_time = time.time()
+        result.r_snapshot_time = self.trial_runner.now_sec()
         result.localization_error_m = self.trial_runner.get_localization_error()
         if result.risk_state_snapshot is None:
             logger.warning(
@@ -734,20 +734,34 @@ class RCTOrchestrator:
         self._last_param_outcomes = outcomes
         self._log_param_outcomes(outcomes)
         self._set_arm_for_config(params)
-        result.c_apply_time = time.time()
-        assert result.c_apply_time > result.r_snapshot_time, (
+
+        result.c_apply_time = self.trial_runner.now_sec()
+        assert result.c_apply_time >= result.r_snapshot_time, (
             "do(C=c) timestamped before the R snapshot — pre-treatment-R "
             "invariant violated.")
         result.params = self.param_space.flatten(params)
 
         # 6. Watch horizon_sec for collision, on a clean window.
+        h_start_x, h_start_y, _ = self.trial_runner.get_current_pose()
         self.trial_runner.reset_probe_collision_state()
         y_h, collision_t = self.trial_runner.watch_probe_collision(self.config.horizon_sec)
         self.trial_runner.stop_probe_drive()
+        h_end_x, h_end_y, _ = self.trial_runner.get_current_pose()
+
+        import math
+        progress_m = math.sqrt((h_end_x - h_start_x) ** 2 + (h_end_y - h_start_y) ** 2)
+        result.probe_progress_m = progress_m
+        result.probe_stalled = int(progress_m < 0.10 and not bool(y_h))
+
         result.y_h = y_h
         result.collision = bool(y_h)
         result.collision_time_sec = collision_t
-        result.status = "COLLISION" if y_h else "PROBE_COMPLETE"
+        if result.probe_stalled:
+            result.status = "PROBE_STALLED"
+        elif y_h:
+            result.status = "COLLISION"
+        else:
+            result.status = "PROBE_COMPLETE"
 
         # Scoped to exactly this horizon window (reset_probe_collision_state()
         # just above is the start of the scope) — confirms y_h=0 means "no
@@ -918,6 +932,13 @@ class RCTOrchestrator:
 
         arm_persistence = self.config.move_arm and self.config.arm_move_on_change_only
         label = params[arm_pd.node][arm_pd.name]
+        if label not in ARM_CONFIGS:
+            preset_match = next(
+                (k for k, v in ARM_CONFIGS.items()
+                 if values_match(label, v["footprint"], "footprint")), None
+            )
+            if preset_match:
+                label = preset_match
         self._last_arm_status["arm_requested_label"] = label
         if arm_persistence and label == self._current_arm_label:
             logger.info(f"  Arm already in '{label}' — skipping move")

@@ -206,73 +206,76 @@ class PoseSampler:
         )
 
     def sample_probe_pose(
-        self, forward_distance_m: float, max_attempts: int = 1000
+        self,
+        forward_distance_m: float = 3.5,
+        max_angle_offset_deg: float = 45.0,
+        max_yaw_offset_deg: float = 45.0,
+        max_attempts: int = 1000,
     ) -> tuple[dict, dict]:
         """
-        Sample a single feasible pose for a Campaign A decision-point probe.
+        Sample a feasible start pose and a local goal pose for Campaign A.
 
-        Unlike sample_start_goal() (a start/goal PAIR under a min/max distance
-        constraint, for full missions), a probe only needs one feasible pose:
-        the "goal" returned here is just `forward_distance_m` straight ahead of
-        the sampled pose along its own heading, used to give Nav2 a short local
-        drive target. Both points are re-sampled together if the forward point
-        falls outside the same clearance-guarded valid_mask sample_start_goal()
-        uses, so the footprint-feasibility guard stays active for probe goals
-        too, not just probe starts.
-
-        Returns:
-            (start, goal) dicts, each with keys x, y, yaw — same shape as
-            sample_start_goal(), so a probe pool is drop-in compatible with the
-            existing presampled-pose-pool loading/assignment machinery.
+        Adds translational and rotational variance:
+        - Distance is sampled in [forward_distance_m, forward_distance_m + 2.0] (e.g. 3.5 to 5.5 m).
+        - Direction angle has a random offset of up to +/- max_angle_offset_deg (e.g. +/- 45 deg).
+        - Goal orientation yaw has a random offset of up to +/- max_yaw_offset_deg.
         """
+        d_min = float(forward_distance_m)
+        d_max = float(forward_distance_m + 2.0)
+        dir_offset_rad = float(np.radians(max_angle_offset_deg))
+        yaw_offset_rad = float(np.radians(max_yaw_offset_deg))
+
         for _ in range(max_attempts):
             idx = self.rng.integers(len(self.valid_indices))
             row, col = self.valid_indices[idx]
             x, y = self._pixel_to_world(row, col)
-            yaw = float(self.rng.uniform(-np.pi, np.pi))
+            start_yaw = float(self.rng.uniform(-np.pi, np.pi))
 
-            goal_x = x + forward_distance_m * np.cos(yaw)
-            goal_y = y + forward_distance_m * np.sin(yaw)
+            d = float(self.rng.uniform(d_min, d_max))
+            dir_angle = float(self.rng.uniform(-dir_offset_rad, dir_offset_rad))
+            yaw_angle = float(self.rng.uniform(-yaw_offset_rad, yaw_offset_rad))
+
+            move_heading = start_yaw + dir_angle
+            goal_x = x + d * np.cos(move_heading)
+            goal_y = y + d * np.sin(move_heading)
+            goal_yaw = float(np.mod(move_heading + yaw_angle + np.pi, 2 * np.pi) - np.pi)
+
             g_row, g_col = self._world_to_pixel(goal_x, goal_y)
 
             in_bounds = (0 <= g_row < self.valid_mask.shape[0]
                          and 0 <= g_col < self.valid_mask.shape[1])
             if in_bounds and self.valid_mask[g_row, g_col]:
                 return (
-                    {"x": float(x), "y": float(y), "yaw": yaw},
-                    {"x": float(goal_x), "y": float(goal_y), "yaw": yaw},
+                    {"x": float(x), "y": float(y), "yaw": start_yaw},
+                    {"x": float(goal_x), "y": float(goal_y), "yaw": goal_yaw},
                 )
 
         raise RuntimeError(
             f"Could not find a feasible probe pose (forward_distance_m="
-            f"{forward_distance_m}) in {max_attempts} attempts. The forward "
-            f"point keeps landing outside the clearance-guarded free space — "
-            f"try a smaller forward_distance_m or check obstacle_clearance_m."
+            f"{forward_distance_m}) in {max_attempts} attempts. Check clearance/map."
         )
 
     def generate_and_save(
         self,
         n_poses: int,
         output_path: str = "presampled_poses.json",
+        campaign: str = "B",
+        forward_distance_m: float = 3.5,
     ) -> list[dict]:
         """
         Pre-generate n pose pairs and save them to a JSON file.
 
         Each entry has: {"start": {"x", "y", "yaw"}, "goal": {"x", "y", "yaw"}, "distance": float}
-
-        Args:
-            n_poses: Number of (start, goal) pairs to generate
-            output_path: Where to save the JSON file
-
-        Returns:
-            The list of generated pose pairs
         """
         import json
 
         poses = []
         for i in range(n_poses):
-            start, goal = self.sample_start_goal()
-            dist = np.sqrt((goal["x"] - start["x"]) ** 2 + (goal["y"] - start["y"]) ** 2)
+            if campaign == "A":
+                start, goal = self.sample_probe_pose(forward_distance_m=forward_distance_m)
+            else:
+                start, goal = self.sample_start_goal()
+            dist = float(np.sqrt((goal["x"] - start["x"]) ** 2 + (goal["y"] - start["y"]) ** 2))
             poses.append({
                 "id": i,
                 "start": start,

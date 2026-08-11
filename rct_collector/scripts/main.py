@@ -227,7 +227,11 @@ def main():
         # Generate poses mode
         if args.generate_poses is not None:
             poses_path = os.path.join(args.output, "presampled_poses.json")
-            poses = sampler.generate_and_save(args.generate_poses, poses_path)
+            poses = sampler.generate_and_save(
+                args.generate_poses, poses_path,
+                campaign=args.campaign,
+                forward_distance_m=args.probe_goal_distance,
+            )
 
             # Also save a visualization with the generated poses
             vis_path = os.path.join(args.output, "presampled_poses.png")
