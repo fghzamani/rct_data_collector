@@ -19,3 +19,8 @@ repositories:
     type: git
     url: https://github.com/fghzamani/rct_data_collector
     version: main
+  online_causal_tuner:
+    type: git
+    url: https://github.com/fghzamani/online_causal_tuner
+    version: main
+    
