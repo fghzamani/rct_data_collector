@@ -88,6 +88,7 @@ def parse_args():
     p.add_argument("--robot-model", default="tiago", help="Gazebo model name")
     p.add_argument("--collision-threshold", type=float, default=0.15)
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--world-name", type=str, default=None, help="Name of the world for dataset metadata")
     p.add_argument("--seed", type=int, default=None)
 
     # --- Campaign A: decision-point collision probes -----------------------
@@ -266,9 +267,16 @@ def main():
         # Campaign B, so run()'s loop bound needs no campaign-specific
         # bookkeeping — just a different CLI flag name for clarity.
         num_trials = args.n_probes if args.campaign == "A" else args.trials
+        world_name = args.world_name
+        if not world_name and args.map:
+            world_name = os.path.basename(os.path.dirname(os.path.abspath(args.map)))
+            if not world_name or world_name in (".", "maps"):
+                world_name = "pal_office"
+
         config = OrchestratorConfig(
             campaign=args.campaign,
             num_trials=num_trials,
+            world_name=world_name or "pal_office",
             horizon_sec=args.horizon_sec,
             baseline_settle_sec=args.baseline_settle_sec,
             washout_sec=args.washout_sec,

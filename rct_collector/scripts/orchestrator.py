@@ -51,6 +51,7 @@ class OrchestratorConfig:
 
     map_yaml_path: str = ""
     map_frame: str = "map"
+    world_name: str = "pal_office"
 
     min_goal_distance: float = 3.0
     max_goal_distance: float = 15.0
@@ -268,6 +269,7 @@ class RCTOrchestrator:
             no_progress_timeout_sec=self.config.no_progress_timeout_sec,
             no_progress_dist_m=self.config.no_progress_dist_m,
             no_progress_yaw_rad=self.config.no_progress_yaw_rad,
+            world_name=self.config.world_name,
             cmd_vel_topic=self.config.cmd_vel_topic,
         )
 
