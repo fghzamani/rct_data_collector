@@ -1046,7 +1046,9 @@ class TrialRunner:
         # Campaign A only: topic for the optional --baseline-nudge Twist burst
         # (see start_probe_drive()). Unused by Campaign B.
         cmd_vel_topic: str = "/mobile_base_controller/cmd_vel",
+        world_name: str = "smoke_office",
     ):
+        self.world_name = world_name
         self.timeout_sec = timeout_sec
         self.collision_threshold = collision_threshold
         self.collect_risk_features = collect_risk_features
