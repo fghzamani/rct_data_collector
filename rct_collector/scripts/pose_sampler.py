@@ -46,7 +46,7 @@ class PoseSampler:
     def __init__(
         self,
         map_yaml_path: str,
-        obstacle_clearance_m: float = 0.35,
+        obstacle_clearance_m: float = 0.55,
         min_goal_distance: float = 10.0,
         max_goal_distance: float = 15.0,
         sampling_bounds: Optional[dict] = None,
