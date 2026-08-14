@@ -141,6 +141,9 @@ class SensorState:
     path_points: Optional[np.ndarray] = None
     path_timestamp: float = 0.0
 
+    # Arm state
+    arm_extension_index: float = 0.0
+
 
 @dataclass
 class ComputeCache:
@@ -179,7 +182,7 @@ class OptimizedRiskStateNode(Node):
     
     # Feature names for documentation/debugging
     FEATURE_NAMES = ['r_min', 'r_width', 'r_ttc', 'r_dens', 
-                     'r_clear', 'r_curve', 'r_grad', 'r_vis']
+                     'r_clear', 'r_curve', 'r_grad', 'r_vis', 'a_t']
     
     def __init__(self):
         super().__init__('optimized_risk_state_node')
@@ -205,7 +208,7 @@ class OptimizedRiskStateNode(Node):
         self._cycles_degraded = 0
         
         # Previous risk state (for graceful degradation)
-        self._previous_risk_state = np.zeros(8, dtype=np.float32)
+        self._previous_risk_state = np.zeros(9, dtype=np.float32)
         
         # Setup QoS profiles
         sensor_qos = QoSProfile(
@@ -232,6 +235,15 @@ class OptimizedRiskStateNode(Node):
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self._tf_failures = 0
         self._tf_attempts = 0
+
+        # Subscribe to joint states for arm extension tracking
+        self._joint_state_sub = self.create_subscription(
+            JointState,
+            '/joint_states',
+            self._joint_state_cb,
+            sensor_qos,
+            callback_group=self._sensor_cb_group
+        )
 
 
 
@@ -503,6 +515,10 @@ class OptimizedRiskStateNode(Node):
             # 8. R_grad - Costmap gradient (cached)
             result[RiskIndex.R_GRAD] = self._compute_r_grad_cached()
             components_computed.append('r_grad')
+
+        # 9. A_t - Arm extension state index
+        result[RiskIndex.A_T] = self.sensor_state.arm_extension_index
+        components_computed.append('a_t')
         
         # Record final timing
         total_ms = (time.perf_counter() - t_start) * 1000
@@ -864,13 +880,26 @@ class OptimizedRiskStateNode(Node):
     # PUBLISHING
     # =========================================================================
     
+    def _joint_state_cb(self, msg: JointState) -> None:
+        """Callback for joint states to compute normalized arm extension index a_t in [0, 1]."""
+        if not msg.name or not msg.position:
+            return
+        try:
+            name_to_pos = dict(zip(msg.name, msg.position))
+            if "arm_4_joint" in name_to_pos:
+                val_4 = name_to_pos["arm_4_joint"]
+                a_t = (1.94 - val_4) / (1.94 - 1.2)
+                self.sensor_state.arm_extension_index = float(np.clip(a_t, 0.0, 1.0))
+        except Exception:
+            pass
+
     def _publish_risk_state(self, risk_state: np.ndarray) -> None:
         """Publish risk state as Float64MultiArray."""
         msg = Float64MultiArray()
         
-        # Setup layout for clarity
+        # Setup layout for clarity (9D vector including a_t)
         msg.layout = MultiArrayLayout()
-        msg.layout.dim = [MultiArrayDimension(label='risk_state', size=8, stride=8)]
+        msg.layout.dim = [MultiArrayDimension(label='risk_state', size=9, stride=9)]
         msg.layout.data_offset = 0
         
         msg.data = risk_state.tolist()

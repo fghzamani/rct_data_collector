@@ -367,6 +367,7 @@ class TrialResult:
     # stay at their dataclass defaults and are blanked out in to_dict() rather
     # than reflecting a (non-existent) mission for Campaign A rows.
     campaign: str = "B"                      # "A" | "B"
+    world_name: str = "smoke_office"
     baseline_config: dict = field(default_factory=dict)   # captured Nav2 launch defaults
     risk_state_snapshot: Optional[dict] = None             # frozen PRE-treatment R
     y_h: Optional[int] = None                # 1 iff a Gazebo contact occurred within horizon_sec of do(C=c)
@@ -507,6 +508,7 @@ class TrialResult:
             d[f"param__{key}"] = val
 
         d["campaign"] = self.campaign
+        d["world_name"] = self.world_name
         if self.campaign == "A":
             # Mission-only columns: the dataclass defaults above describe a
             # mission that never happened for a probe row. Blank them rather
@@ -2192,6 +2194,7 @@ class TrialRunner:
             return
         payload = {
             "trial_id": result.trial_id,
+            "world_name": getattr(self, "world_name", "smoke_office"),
             "status": result.status,
             "terminated_by_runner": result.terminated_by_runner,
             "is_collided": result.collision,
