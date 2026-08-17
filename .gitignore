@@ -1,6 +1,9 @@
 # Python cache / bytecode
+__pycache__/
 **/__pycache__/
+**/__pycache__/**
 *.pyc
+**/*.pyc
 *.pyo
 *.pyd
 

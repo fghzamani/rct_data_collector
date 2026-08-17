@@ -33,7 +33,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, JointState
 from nav_msgs.msg import Odometry, Path
 from nav2_msgs.msg import Costmap
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -70,6 +70,7 @@ class RiskIndex(IntEnum):
     R_CURVE = 5    # Path curvature
     R_GRAD = 6     # Costmap gradient
     R_VIS = 7      # Visibility risk
+    A_T = 8        # Arm extension state index
 
 
 @dataclass

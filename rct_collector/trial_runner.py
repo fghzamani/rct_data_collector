@@ -188,7 +188,7 @@ def _min_distance_to_obstacle(costmap_array: np.ndarray, robot_rc: np.ndarray,
 
 @dataclass
 class RiskStateRecord:
-    """One timestamped 8-D risk-state observation from /risk_state."""
+    """One timestamped 9-D risk-state observation from /risk_state."""
     timestamp: float
     r_min: float      # min obstacle distance
     r_width: float    # corridor width
@@ -198,11 +198,12 @@ class RiskStateRecord:
     r_curve: float    # path curvature
     r_grad: float     # costmap gradient
     r_vis: float      # visibility risk
+    a_t: float        # arm extension state index
 
     @classmethod
     def from_array(cls, timestamp: float, data: list) -> "RiskStateRecord":
-        if len(data) != 8:
-            raise ValueError(f"Expected 8 risk values, got {len(data)}")
+        if len(data) != 9:
+            raise ValueError(f"Expected 9 risk values, got {len(data)}")
         return cls(timestamp, *[float(v) for v in data])
 
 
