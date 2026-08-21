@@ -2126,8 +2126,8 @@ class TrialRunner:
         for attempt in range(1, attempts + 1):
             for srv, typ in services:
                 try:
-                    subprocess.run(["ros2", "service", "call", srv, typ, state],
-                                   capture_output=True, text=True, timeout=1.0)
+                    cmd = ["bash", "-c", f"source /opt/ros/humble/setup.bash && export ROS_LOCALHOST_ONLY=1 && ros2 service call {srv} {typ} '{state}'"]
+                    subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)
                 except subprocess.TimeoutExpired:
                     logger.warning(
                         f"  {srv} timed out (attempt {attempt}/{attempts})")
@@ -2140,7 +2140,7 @@ class TrialRunner:
                     logger.info(
                         f"  Teleported to ({pose['x']:.2f}, {pose['y']:.2f}) ✓")
                     return True
-            time.sleep(0.2)
+            time.sleep(0.5)
 
         gx, gy, _ = self._recorder.pose()
         logger.error(
