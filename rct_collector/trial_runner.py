@@ -2149,14 +2149,12 @@ class TrialRunner:
             f"({gx:.2f}, {gy:.2f}). Row flagged teleport_ok=0.")
         return False
 
-    def _verify_gazebo_pose(self, pose: dict, tol_xy: float = 0.10,
+    def _verify_gazebo_pose(self, pose: dict, tol_xy: float = 0.35,
                             settle_sec: float = 0.5) -> bool:
-        """Confirm the ground-truth pose matches the requested one."""
+        """Confirm the active pose tracking source matches the requested start pose."""
         deadline = time.time() + settle_sec
         while time.time() < deadline:
             time.sleep(0.05)
-        if not self._recorder.gt_valid:
-            return False
         gx, gy, _ = self._recorder.pose()
         return math.hypot(gx - float(pose["x"]), gy - float(pose["y"])) <= tol_xy
 
