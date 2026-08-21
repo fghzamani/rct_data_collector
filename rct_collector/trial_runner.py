@@ -2120,11 +2120,14 @@ class TrialRunner:
             ("/set_model_state", "gazebo_msgs/srv/SetModelState"),
         )
 
+        # Publish /initialpose to AMCL and Nav2 immediately
+        self._publish_initial_pose(pose)
+
         for attempt in range(1, attempts + 1):
             for srv, typ in services:
                 try:
                     subprocess.run(["ros2", "service", "call", srv, typ, state],
-                                   capture_output=True, text=True, timeout=15)
+                                   capture_output=True, text=True, timeout=1.0)
                 except subprocess.TimeoutExpired:
                     logger.warning(
                         f"  {srv} timed out (attempt {attempt}/{attempts})")
@@ -2137,7 +2140,7 @@ class TrialRunner:
                     logger.info(
                         f"  Teleported to ({pose['x']:.2f}, {pose['y']:.2f}) ✓")
                     return True
-            time.sleep(1.0)
+            time.sleep(0.2)
 
         gx, gy, _ = self._recorder.pose()
         logger.error(
