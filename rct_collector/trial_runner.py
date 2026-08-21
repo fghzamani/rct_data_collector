@@ -1134,7 +1134,10 @@ class TrialRunner:
         self._initpose_pub = self._navigator.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", qos)
 
-        self._assert_collision_channel()
+        try:
+            self._assert_collision_channel(timeout_sec=2.0)
+        except RuntimeError as err:
+            logger.warning(f"Notice: {err} Falling back to LiDAR + Footprint Collision Checker.")
         self._wait_for_ground_truth(min_rate_hz=self.gt_min_rate_hz)
 
     def _assert_collision_channel(self, timeout_sec: float = 10.0):
