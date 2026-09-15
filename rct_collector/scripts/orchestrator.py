@@ -190,15 +190,13 @@ class OrchestratorConfig:
     arm_joint_tolerance_rad: float = 0.15
     arm_settle_sec: float = 4.0      # must match arm_move_time_sec
 
-    # --- Campaign selection ------------------------------------------------
-    # "B" (default): current full-mission behavior, unchanged.
-    # "A": short decision-point collision probes (see _run_single_probe). The
+    # --- Probe execution settings ------------------------------------------
+    # Short decision-point collision probes (see _run_single_probe). The
     # baseline these probes snapshot R under is CAPTURED from Nav2's live
     # launch-default parameter values at startup (_capture_baseline_config),
     # not a hardcoded profile — its specific values don't matter for
     # identification, only that it is fixed and applied before every R
     # snapshot.
-    campaign: str = "B"
     horizon_sec: float = 8.0            # how long to watch for a collision after do(C=c).
                                         # MUST exceed arm_move_time_sec (4 s) with room to
                                         # spare, or the arm is still unfolding when the
@@ -297,7 +295,6 @@ class RCTOrchestrator:
         self._pose_index_map: Optional[list] = None
         self._config_index_map: Optional[list] = None
 
-        # Campaign A only.
         self._baseline_config: Optional[dict] = None       # captured Nav2 launch defaults, {node:{name:value}}
         self._last_baseline_outcomes: list = []             # list[ParamOutcome], from the most recent reassert
 
@@ -369,17 +366,12 @@ class RCTOrchestrator:
         self._init_param_applier()
 
         self._verify_nav2_running()
-        if self.config.campaign == "A":
-            # Goal tolerance is a mission-only concept (Campaign B's early-stop
-            # / success check); probes don't have one.
-            self._baseline_config = self._capture_baseline_config()
-            logger.info(
-                "Campaign A baseline (captured from Nav2's live launch-default "
-                f"values, NOT a hardcoded profile): "
-                f"{self.param_space.flatten(self._baseline_config)}")
-            self._save_assignment_maps()   # re-write with baseline_config now known
-        elif self.config.check_goal_tolerance_against_nav2:
-            self._verify_goal_tolerance()
+        self._baseline_config = self._capture_baseline_config()
+        logger.info(
+            "Baseline (captured from Nav2's live launch-default "
+            f"values, NOT a hardcoded profile): "
+            f"{self.param_space.flatten(self._baseline_config)}")
+        self._save_assignment_maps()   # re-write with baseline_config now known
 
     def _init_param_applier(self):
         import rclpy
@@ -530,14 +522,14 @@ class RCTOrchestrator:
             logger.info(f"  {name} matches Nav2 ({nav2_val}) ✓")
 
     def _capture_baseline_config(self) -> dict:
-        """Capture the FIXED baseline Campaign A snapshots R under, by reading
+        """Capture the FIXED baseline probe snapshots R under, by reading
         back Nav2's live launch-default value for every parameter param_space
         controls. Not a hardcoded profile: a probe's baseline only needs to be
         config-independent and identical every probe, and re-deriving it from
         whatever Nav2 actually booted with is both more honest and impossible
         to let drift out of sync with the live stack.
 
-        Startup-fatal on any read failure — Campaign A cannot begin without
+        Startup-fatal on any read failure — probe collection cannot begin without
         confirming what "baseline" concretely means for this run.
         """
         from rct_collector.scripts.param_applier import values_match
@@ -552,7 +544,7 @@ class RCTOrchestrator:
             if err:
                 raise RuntimeError(
                     f"Could not read back the live value of {p.ros_node}/{p.name} "
-                    f"to establish Campaign A's baseline ({err}). Refusing to "
+                    f"to establish the baseline ({err}). Refusing to "
                     "start with a guessed baseline."
                 )
             if p.apply_via == "footprint":
@@ -684,10 +676,6 @@ class RCTOrchestrator:
                     "pose_assignment": self.config.pose_assignment,
                     "pose_index_map": self._pose_index_map,
                     "config_index_map": self._config_index_map,
-                    "campaign": self.config.campaign,
-                    # Campaign A provenance: None until _capture_baseline_config()
-                    # has run (this is called once before that, from
-                    # _load_presampled(), and again right after, in initialize()).
                     "baseline_config": self._baseline_config,
                 }, f)
             logger.info(f"Assignment map written to {path}")
@@ -704,9 +692,7 @@ class RCTOrchestrator:
     def run(self):
         self._load_checkpoint()
         start_trial = self.completed_trials
-        unit = "probes" if self.config.campaign == "A" else "trials"
-        logger.info(f"RCT collection ({self.config.campaign}): "
-                   f"{unit} {start_trial+1}..{self.config.num_trials}")
+        logger.info(f"RCT probe collection: probes {start_trial+1}..{self.config.num_trials}")
 
         for trial_idx in range(start_trial, self.config.num_trials):
             if self._shutdown_requested:
@@ -714,26 +700,17 @@ class RCTOrchestrator:
 
             trial_id = trial_idx + 1
             logger.info(f"\n{'='*60}")
-            logger.info(f"{unit.upper()[:-1]} {trial_id}/{self.config.num_trials}")
+            logger.info(f"PROBE {trial_id}/{self.config.num_trials}")
             logger.info(f"{'='*60}")
 
             try:
-                if self.config.campaign == "A":
-                    result = self._run_single_probe(trial_id)
-                else:
-                    result = self._run_single_trial(trial_id)
+                result = self._run_single_probe(trial_id)
                 self._record_result(trial_id, result)
                 self.consecutive_failures = 0
 
                 # A run where the treatment repeatedly fails to reach the stack
                 # is producing rows whose recorded C_t is not the applied C_t.
-                # Better to stop than to fill a CSV with unusable trials. For
-                # Campaign A, self._last_param_outcomes is the C (treatment)
-                # apply's outcomes — baseline-reassert breakage is tracked
-                # separately (see _run_single_probe / baseline_valid) and
-                # already folds into that row's treatment_valid via
-                # _record_result, but does not by itself trip this
-                # consecutive-failure guard the same way a broken c does.
+                # Better to stop than to fill a CSV with unusable trials.
                 broken = [o for o in self._last_param_outcomes if o.breaks_integrity]
                 if broken:
                     self.consecutive_integrity_failures += 1
@@ -766,68 +743,11 @@ class RCTOrchestrator:
         self.shutdown()
         logger.info(f"Done. {self.completed_trials} trials recorded.")
 
-    def _run_single_trial(self, trial_id: int) -> TrialResult:
-        idx = trial_id - 1  # trials are 1-indexed; lists are 0-indexed
-        self._last_pool_indices = {"config": None, "pose": None}
-
-        # 1. Get this trial's config: pre-generated if available, else fresh
-        if self.presampled_configs is not None:
-            cfg_idx = (self._config_index_map[idx]
-                       if self._config_index_map is not None else idx)
-            self._last_pool_indices["config"] = cfg_idx
-            params = self.presampled_configs[cfg_idx]
-            logger.info(f"  Config (presampled #{cfg_idx}): {self.param_space.flatten(params)}")
-        else:
-            params = self.param_space.sample()
-            logger.info(f"  Config (fresh): {self.param_space.flatten(params)}")
-
-        # 1a. Reset Gazebo. When we rely on arm persistence (move_arm +
-        #     move-on-change), /reset_world is SKIPPED because it resets joint
-        #     states and would snap the arm back every trial. The base is
-        #     repositioned by the per-trial teleport instead.
-        arm_persistence = self.config.move_arm and self.config.arm_move_on_change_only
-        if self.config.reset_gazebo_between_trials and not arm_persistence:
-            self._reset_gazebo()
-
-        # 1b. Move the physical arm — only when needed (first trial, label change,
-        #     or after a failed/unknown move). When not relying on persistence,
-        #     the arm is re-commanded every trial.
-        self._set_arm_for_config(params)
-
-        # 2. Apply via dynamic reconfigure, with read-back verification
-        outcomes = self._apply_params(params)
-        self._last_param_outcomes = outcomes
-        self._log_param_outcomes(outcomes)
-
-        # 3. Get this trial's poses: pre-generated if available, else fresh
-        if self.presampled_poses is not None:
-            pose_idx = (self._pose_index_map[idx]
-                        if self._pose_index_map is not None else idx)
-            self._last_pool_indices["pose"] = pose_idx
-            entry = self.presampled_poses[pose_idx]
-            start_pose, goal_pose = entry["start"], entry["goal"]
-            logger.info(f"  Pose (presampled #{pose_idx})")
-        else:
-            start_pose, goal_pose = self.pose_sampler.sample_start_goal()
-        logger.info(f"  Start: ({start_pose['x']:.2f}, {start_pose['y']:.2f})")
-        logger.info(f"  Goal:  ({goal_pose['x']:.2f}, {goal_pose['y']:.2f})")
-
-        # 4. Run navigation
-        return self.trial_runner.run_trial(
-            trial_id=trial_id,
-            start_pose=start_pose,
-            goal_pose=goal_pose,
-            params=params,
-        )
-
     def _run_single_probe(self, probe_id: int) -> TrialResult:
-        """Execute one Campaign A decision-point probe and return its row.
+        """Execute one decision-point probe and return its row.
 
-        Step numbering matches the design this was reviewed against:
-          1. Re-assert the captured baseline (belt — never skipped; this, not
-             the end-of-probe revert in step 7, is what actually guarantees R
-             is snapshotted under a fixed, treatment-independent state rather
-             than whatever `c` the PREVIOUS probe left the stack in).
+        Step numbering matches the probe design:
+          1. Re-assert the captured baseline (belt — never skipped).
           2. Sample a pose, start driving toward a short local goal under
              baseline.
           3. Settle under baseline, watched for a baseline-phase collision.
@@ -840,7 +760,7 @@ class RCTOrchestrator:
         idx = probe_id - 1
         self._last_pool_indices = {"config": None, "pose": None}
         result = TrialResult(
-            trial_id=probe_id, campaign="A", run_id=self.run_id,
+            trial_id=probe_id, run_id=self.run_id,
             horizon_sec=self.config.horizon_sec,
             baseline_settle_sec=self.config.baseline_settle_sec,
             washout_sec=self.config.washout_sec,
@@ -1190,11 +1110,10 @@ class RCTOrchestrator:
         return result
 
     def _finalize_probe(self, result: TrialResult, probe_id: int) -> None:
-        """Write a Campaign A probe's lean JSON (no time-series — see
+        """Write a probe's lean JSON (no time-series — see
         TrialRunner.write_probe_json) and stamp result.json_path."""
         payload = {
             "trial_id": probe_id,
-            "campaign": "A",
             "run_id": self.run_id,
             "status": result.status,
             "failure_reason": result.failure_reason,
@@ -1510,13 +1429,6 @@ class RCTOrchestrator:
         arm if needed (respecting arm_move_on_change_only persistence), and
         verify via /joint_states. Fills self._last_arm_status. A no-op
         (status stays blank) when move_arm=False.
-
-        Extracted from _run_single_trial's former inline arm-handling block —
-        pure extraction, same calls in the same order under the same
-        conditions — so Campaign A probes (which call this twice per probe:
-        once for the baseline label, once for c's label) share the exact same
-        persistence/verification logic Campaign B missions use, rather than a
-        second implementation that could drift from it.
         """
         self._last_arm_status = {
             "arm_requested_label": "",
@@ -1745,17 +1657,13 @@ class RCTOrchestrator:
         #                   read-back alone does not invalidate a trial.
         row["config_verified"] = int(len(not_ok) == 0)
         row["treatment_valid"] = int(len(rejected) == 0 and len(mismatched) == 0)
-        # Campaign A: a probe whose BASELINE reassert didn't fully apply is
-        # just as unusable as one whose c didn't — R would not have been
-        # snapshotted under the fixed pre-treatment state the campaign
-        # requires. baseline_valid is scored in _run_single_probe / to_dict().
-        if result.campaign == "A" and not result.baseline_valid:
+        # A probe whose BASELINE reassert didn't fully apply is unusable as
+        # R would not have been snapshotted under the fixed pre-treatment state.
+        if not result.baseline_valid:
             row["treatment_valid"] = 0
         # A probe aborted during baseline settle never reaches step 5 — c was
-        # never applied at all (self._last_param_outcomes is empty for that
-        # row, which would otherwise read as vacuously "nothing rejected").
-        # treatment_valid must say "not applicable", not "valid".
-        if result.campaign == "A" and result.status == "BASELINE_COLLISION":
+        # never applied at all. treatment_valid must say "not applicable", not "valid".
+        if result.status == "BASELINE_COLLISION":
             row["treatment_valid"] = 0
         row["config_valid"] = row["treatment_valid"]   # legacy alias
         row["param_apply_detail"] = ";".join(

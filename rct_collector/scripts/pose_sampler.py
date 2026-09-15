@@ -10,7 +10,7 @@ Samples random start and goal poses that are:
 
 The map is loaded from a standard ROS map_server YAML + PGM/PNG pair.
 
-Campaign A probe sampling
+Decision-point probe sampling
 -------------------------
 The v2 sampler (``sample_stratified_probe_pose``, ``constriction="rooms"``)
 replaces the straight-line constriction test used by the v1 samplers. Three
@@ -98,7 +98,7 @@ class PoseSampler:
         # --- v2 geometry -------------------------------------------------
         # Circumscribed radii of the two footprint polygons, NOT inscribed.
         # Measured from param_actual__local_costmap__footprint in the
-        # Campaign A CSV: worst tucked vertex (0.217, 0.242) -> 0.325 m;
+        # Probe CSV: worst tucked vertex (0.217, 0.242) -> 0.325 m;
         # worst carry vertex (0.480, -0.698) -> 0.847 m.
         nav_radius_m: float = 0.325,
         carry_radius_m: float = 0.847,
@@ -358,7 +358,7 @@ class PoseSampler:
         max_attempts: int = 1000,
     ) -> tuple[dict, dict]:
         """
-        Sample a feasible start pose and a local goal pose for Campaign A.
+        Sample a feasible start pose and a local goal pose for decision probes.
 
         Adds translational and rotational variance:
         - Distance is sampled in [forward_distance_m, forward_distance_m + 2.0].
@@ -1004,7 +1004,6 @@ class PoseSampler:
         self,
         n_poses: int,
         output_path: str = "presampled_poses.json",
-        campaign: str = "B",
         forward_distance_m: float = 3.5,
         constriction: bool = False,
         constriction_kwargs: Optional[dict] = None,
@@ -1015,7 +1014,7 @@ class PoseSampler:
         Each entry has: {"start": {"x","y","yaw"}, "goal": {"x","y","yaw"},
         "distance": float, "crossed": bool, "stratum": str, "meta": {...}}.
 
-        ``constriction`` selects the Campaign A sampler:
+        ``constriction`` selects the probe sampler:
           "rooms"     v2 room-topology strata (recommended)
           "enriched"  v1 three-stratum sampler
           True        v1 single-constriction sampler
@@ -1037,24 +1036,22 @@ class PoseSampler:
             crossed = None
             stratum = None
             meta = None
-            if campaign == "A" and constriction == "rooms":
+            if constriction == "rooms":
                 start, goal, crossed, stratum, meta = \
                     self.sample_stratified_probe_pose(
                         d_min_m=forward_distance_m,
                         d_max_m=forward_distance_m + 1.9, **ck)
                 n_crossed += int(crossed)
-            elif campaign == "A" and constriction == "enriched":
+            elif constriction == "enriched":
                 start, goal, crossed, stratum = self.sample_probe_pose_enriched(
                     forward_distance_m=forward_distance_m, **ck)
                 n_crossed += int(crossed)
-            elif campaign == "A" and constriction:
+            elif constriction:
                 start, goal, crossed = self.sample_constriction_probe_pose(
                     forward_distance_m=forward_distance_m, **ck)
                 n_crossed += int(crossed)
-            elif campaign == "A":
-                start, goal = self.sample_probe_pose(forward_distance_m=forward_distance_m)
             else:
-                start, goal = self.sample_start_goal()
+                start, goal = self.sample_probe_pose(forward_distance_m=forward_distance_m)
 
             dist = float(np.sqrt((goal["x"] - start["x"]) ** 2
                                  + (goal["y"] - start["y"]) ** 2))
@@ -1078,7 +1075,7 @@ class PoseSampler:
         logger.info(f"Saved {len(poses)} pose pairs to {output_path}")
 
         from collections import Counter
-        if campaign == "A" and constriction in ("rooms", "enriched"):
+        if constriction in ("rooms", "enriched"):
             strata = Counter(p.get("stratum", "?") for p in poses)
             logger.info(f"Crossing: {n_crossed}/{n_poses} "
                         f"({100*n_crossed/max(n_poses,1):.0f}%). Strata: {dict(strata)}")
@@ -1087,7 +1084,7 @@ class PoseSampler:
                 logger.warning(
                     f"{n_fb} pairs fell back to a plain probe pose. Check "
                     "room_split_clearance_m and the distance band.")
-        elif campaign == "A" and constriction:
+        elif constriction:
             logger.info(f"Constriction-crossing: {n_crossed}/{n_poses} "
                         f"({100*n_crossed/max(n_poses,1):.0f}%); the rest fell back "
                         "to ordinary probe poses.")

@@ -192,11 +192,9 @@ risk_topic: "/risk_state"
 # treatment values: r_grad is rebuilt from the costmap's lethal (==254) cells,
 # which the inflation layer never overwrites, so the feature still responds to
 # dynamic obstacles while staying independent of C_t. Keep them fixed for the
-# whole campaign and report them alongside the feature definition.
+# whole experiment and report them alongside the feature definition.
 risk_inflation_radius_m: 0.30
 risk_cost_scaling_factor: 10.0
-
-
 
 apply_mode: "early_time"
 t_apply_min_sec: 0.5
@@ -212,7 +210,7 @@ horizon_sec: 5.0
 # instead of being folded into final_xy_error.
 #
 # The runner aborts at startup if /gazebo/model_states never yields the robot, or
-# if nothing publishes /gazebo/collision. Before the full campaign, confirm the
+# if nothing publishes /gazebo/collision. Before the data collection run, confirm the
 # collision channel end to end by driving into a wall:
 #   ros2 topic echo /gazebo/collision &
 #   ros2 topic pub -r 10 /mobile_base_controller/cmd_vel geometry_msgs/msg/Twist \

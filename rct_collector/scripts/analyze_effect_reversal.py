@@ -2,7 +2,7 @@
 """
 analyze_effect_reversal.py — Gap 1: Effect-Modification & Configuration Ranking Reversal Analysis
 
-Analyzes RCT probe data (Campaign A) to demonstrate configuration rank flipping across environmental
+Analyzes RCT probe data to demonstrate configuration rank flipping across environmental
 risk features (R_width, R_min, R_ttc). Calculates 95% Bayesian / bootstrap credible intervals for
 delta_P = P(Y^H=1 | do(c1), R) - P(Y^H=1 | do(c2), R) to confirm that configuration ordering reverses
 across environmental contexts with credible intervals strictly excluding no-effect (0.0).
@@ -69,7 +69,7 @@ def main():
     X = []
     y = []
     
-    # Generate synthetic RCT Campaign A dataset:
+    # Generate synthetic RCT dataset:
     # r_width in [-2.0, 2.0], c_inf in {-1.0, 1.0}
     for _ in range(n):
         r_w = random.uniform(-2.0, 2.0)

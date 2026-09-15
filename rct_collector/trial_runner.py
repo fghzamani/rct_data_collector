@@ -362,13 +362,7 @@ class TrialResult:
     xy_goal_tolerance_used: float = float("nan")
     yaw_goal_tolerance_used: float = float("nan")
 
-    # ── Campaign A: decision-point collision probes ─────────────────────────
-    # A second, coexisting row shape (see TrialRunner.start_probe_drive() /
-    # RCTOrchestrator._run_single_probe()). `campaign` selects which of these
-    # two field groups a row actually populates; the mission-only fields above
-    # stay at their dataclass defaults and are blanked out in to_dict() rather
-    # than reflecting a (non-existent) mission for Campaign A rows.
-    campaign: str = "B"                      # "A" | "B"
+    # ── Decision-point collision probes ─────────────────────────────────────
     world_name: str = "smoke_office"
     baseline_config: dict = field(default_factory=dict)   # captured Nav2 launch defaults
     risk_state_snapshot: Optional[dict] = None             # frozen PRE-treatment R
@@ -531,74 +525,61 @@ class TrialResult:
         for key, val in self.params.items():
             d[f"param__{key}"] = val
 
-        d["campaign"] = self.campaign
         d["world_name"] = self.world_name
-        if self.campaign == "A":
-            # Mission-only columns: the dataclass defaults above describe a
-            # mission that never happened for a probe row. Blank them rather
-            # than let e.g. travel_time_sec=0.0 or success_true=None be
-            # mistaken for a real (null) mission measurement.
-            for key in (
-                "goal_x", "goal_y", "goal_yaw",
-                "travel_time_sec", "path_length_m", "initial_global_path_length_m",
-                "final_xy_error", "final_yaw_error",
-                "min_obstacle_distance", "min_obstacle_distance_valid", "scan_self_hit_fraction",
-                "min_map_obstacle_distance", "min_global_obstacle_distance",
-                "num_risk_samples", "num_controller_samples", "global_planner_ticks",
-                "success_true", "believed_within_tolerance", "success_believed",
-                "belief_censored", "outcome_agreement",
-                "believed_final_xy_error", "believed_final_yaw_error", "belief_error_gap_m",
-                "gt_ever_within_tolerance", "t_first_within_tolerance",
-                "xy_goal_tolerance_used", "yaw_goal_tolerance_used",
-                "bt_failed_node", "bt_failure_detail", "nav2_result", "longest_stall_sec",
-                # These three are only meaningful when computed from a recorded
-                # trajectory (rec.controller_path), which Campaign A never
-                # populates by design (no time-series recording — see the probe
-                # JSON docstring). Left at their dataclass defaults they read as
-                # real (bad) measurements rather than "not applicable": in
-                # particular unique_pose_fraction defaults to 0.0, which is
-                # indistinguishable from "100% quantised poses" to
-                # _save_final_results()'s quantised_pose_trials check.
-                "pose_source", "gt_msgs_seen", "unique_pose_fraction",
-            ):
-                d[key] = ""
+        # Blank mission-only columns that do not apply to probe rows.
+        for key in (
+            "goal_x", "goal_y", "goal_yaw",
+            "travel_time_sec", "path_length_m", "initial_global_path_length_m",
+            "final_xy_error", "final_yaw_error",
+            "min_obstacle_distance", "min_obstacle_distance_valid", "scan_self_hit_fraction",
+            "min_map_obstacle_distance", "min_global_obstacle_distance",
+            "num_risk_samples", "num_controller_samples", "global_planner_ticks",
+            "success_true", "believed_within_tolerance", "success_believed",
+            "belief_censored", "outcome_agreement",
+            "believed_final_xy_error", "believed_final_yaw_error", "belief_error_gap_m",
+            "gt_ever_within_tolerance", "t_first_within_tolerance",
+            "xy_goal_tolerance_used", "yaw_goal_tolerance_used",
+            "bt_failed_node", "bt_failure_detail", "nav2_result", "longest_stall_sec",
+            "pose_source", "gt_msgs_seen", "unique_pose_fraction",
+        ):
+            d[key] = ""
 
-            d["baseline_valid"] = int(self.baseline_valid)
-            d["y_h"] = _b(self.y_h)
-            d["collision_time_sec"] = (
-                "" if self.collision_time_sec is None else self.collision_time_sec)
-            d["probe_progress_m"] = (
-                "" if self.probe_progress_m is None else round(self.probe_progress_m, 3))
-            d["probe_stalled"] = _b(self.probe_stalled)
-            d["r_snapshot_time"] = self.r_snapshot_time
-            d["c_apply_time"] = self.c_apply_time
-            d["horizon_sec"] = self.horizon_sec
-            d["baseline_settle_sec"] = self.baseline_settle_sec
-            d["washout_sec"] = self.washout_sec
-            d["t_apply_sim"] = round(self.t_apply_sim, 3)
-            d["speed_limit_pct_applied"] = self.speed_limit_pct_applied
-            d["no_switch"] = int(self.no_switch)
-            d["d_total_plan_m"] = round(self.d_total_plan_m, 3)
-            d["s_apply_target_m"] = round(self.s_apply_target_m, 3)
-            d["d_remaining_at_apply_m"] = round(self.d_remaining_at_apply_m, 3)
-            d["d_guard_m"] = round(self.d_guard_m, 3)
-            d["trigger_reason"] = self.trigger_reason
-            d["trigger_fraction"] = round(self.trigger_fraction, 4)
-            d["n_short_plan_rejects"] = self.n_short_plan_rejects
-            d["arrived_within_H"] = self.arrived_within_H
-            d["achieved_max_vx"] = round(self.achieved_max_vx, 3)
-            d["achieved_p95_vx"] = round(self.achieved_p95_vx, 3)
-            d["achieved_max_wz"] = round(self.achieved_max_wz, 3)
-            d["achieved_min_obstacle_distance"] = round(self.achieved_min_obstacle_distance, 3)
-            d["mean_path_deviation_m"] = round(self.mean_path_deviation_m, 3)
+        d["baseline_valid"] = int(self.baseline_valid)
+        d["y_h"] = _b(self.y_h)
+        d["collision_time_sec"] = (
+            "" if self.collision_time_sec is None else self.collision_time_sec)
+        d["probe_progress_m"] = (
+            "" if self.probe_progress_m is None else round(self.probe_progress_m, 3))
+        d["probe_stalled"] = _b(self.probe_stalled)
+        d["r_snapshot_time"] = self.r_snapshot_time
+        d["c_apply_time"] = self.c_apply_time
+        d["horizon_sec"] = self.horizon_sec
+        d["baseline_settle_sec"] = self.baseline_settle_sec
+        d["washout_sec"] = self.washout_sec
+        d["t_apply_sim"] = round(self.t_apply_sim, 3)
+        d["speed_limit_pct_applied"] = self.speed_limit_pct_applied
+        d["no_switch"] = int(self.no_switch)
+        d["d_total_plan_m"] = round(self.d_total_plan_m, 3)
+        d["s_apply_target_m"] = round(self.s_apply_target_m, 3)
+        d["d_remaining_at_apply_m"] = round(self.d_remaining_at_apply_m, 3)
+        d["d_guard_m"] = round(self.d_guard_m, 3)
+        d["trigger_reason"] = self.trigger_reason
+        d["trigger_fraction"] = round(self.trigger_fraction, 4)
+        d["n_short_plan_rejects"] = self.n_short_plan_rejects
+        d["arrived_within_H"] = self.arrived_within_H
+        d["achieved_max_vx"] = round(self.achieved_max_vx, 3)
+        d["achieved_p95_vx"] = round(self.achieved_p95_vx, 3)
+        d["achieved_max_wz"] = round(self.achieved_max_wz, 3)
+        d["achieved_min_obstacle_distance"] = round(self.achieved_min_obstacle_distance, 3)
+        d["mean_path_deviation_m"] = round(self.mean_path_deviation_m, 3)
 
-            # baseline_config / risk_state_snapshot are stored flat already
-            # (baseline_config the same way self.params is: pre-flattened by
-            # ParameterSpace.flatten() before being handed to TrialResult).
-            for key, val in self.baseline_config.items():
-                d[f"baseline_config__{key}"] = val
-            for key, val in (self.risk_state_snapshot or {}).items():
-                d[f"risk__{key}"] = val
+        # baseline_config / risk_state_snapshot are stored flat already
+        # (baseline_config the same way self.params is: pre-flattened by
+        # ParameterSpace.flatten() before being handed to TrialResult).
+        for key, val in self.baseline_config.items():
+            d[f"baseline_config__{key}"] = val
+        for key, val in (self.risk_state_snapshot or {}).items():
+            d[f"risk__{key}"] = val
 
         return d
 
@@ -1093,8 +1074,8 @@ class TrialRunner:
         no_progress_timeout_sec: float = 20.0,
         no_progress_dist_m: float = 0.10,
         no_progress_yaw_rad: float = 0.20,
-        # Campaign A only: topic for the optional --baseline-nudge Twist burst
-        # (see start_probe_drive()). Unused by Campaign B.
+        # Topic for the optional --baseline-nudge Twist burst
+        # (see start_probe_drive()).
         cmd_vel_topic: str = "/mobile_base_controller/cmd_vel",
         world_name: str = "smoke_office",
     ):
@@ -1266,20 +1247,19 @@ class TrialRunner:
         """
         return self._recorder.get_joint_positions(names)
 
-    # ── Campaign A: decision-point collision probes ──
+    # ── Decision-point collision probes ──
     #
-    # These four methods are the ROS/Gazebo-layer primitives a probe needs.
+    # These methods are the ROS/Gazebo-layer primitives a probe needs.
     # Deliberately thin: config application (baseline AND the random c) stays
     # owned by RCTOrchestrator._run_single_probe() via its existing
-    # param_applier / _set_arm_for_config(), exactly like Campaign B. Splitting
+    # param_applier / _set_arm_for_config(). Splitting
     # start_probe_drive() (non-blocking) from watch_probe_collision() (blocking)
     # is what lets the orchestrator apply c mid-drive, between the two calls.
 
     def start_probe_drive(self, start_pose: dict, goal_pose: dict,
                           nudge: bool = False) -> bool:
         """Teleport + localize at start_pose, then begin driving (non-blocking)
-        toward goal_pose via the same goToPose()/behavior_tree Campaign B
-        missions use. Campaign A step 2.
+        toward goal_pose via goToPose()/behavior_tree (Probe step 2).
 
         Returns teleport_ok. Everything downstream (baseline settle, the R
         snapshot, applying c mid-flight, watching horizon_sec) is the caller's
@@ -1328,8 +1308,8 @@ class TrialRunner:
         self._cmd_vel_pub.publish(Twist())  # stop before goToPose takes over
 
     def get_risk_snapshot(self) -> Optional[dict]:
-        """Read the risk-state vector ONCE, as it stands right now. Campaign A
-        step 4 (the frozen pre-treatment R).
+        """Read the risk-state vector ONCE, as it stands right now (the frozen
+        pre-treatment R).
 
         /risk_state is published continuously and independently of any
         trial/probe's recording state (see
@@ -1363,7 +1343,6 @@ class TrialRunner:
 
     def watch_probe_collision(self, horizon_sec: float) -> tuple:
         """Poll for a Gazebo collision for `horizon_sec` starting now.
-        Campaign A step 6.
 
         Same 100 Hz poll cadence _record_navigation() uses for missions.
         Returns (y_h, collision_time_sec): y_h=1 the instant
@@ -1422,7 +1401,7 @@ class TrialRunner:
 
     def stop_probe_drive(self) -> None:
         """Cancel the in-flight goToPose() action started by
-        start_probe_drive(). Campaign A step 6/7."""
+        start_probe_drive()."""
         self._navigator.cancelTask()
         self._recorder._recording = False
 
@@ -2316,13 +2295,9 @@ class TrialRunner:
         return obj
 
     def write_probe_json(self, payload: dict, probe_id: int) -> str:
-        """Write a Campaign A probe's JSON payload. Same namespacing/path
+        """Write a probe's JSON payload. Same namespacing/path
         convention as _finalize_json() (trials/trial_<run_id>_<id>.json), same
-        _json_safe() NaN/Inf handling — deliberately NOT the same payload
-        shape, though: a probe has no time-series to write (see
-        RCTOrchestrator._run_single_probe / TrialResult.campaign), so this
-        stays a separate, much smaller writer rather than a branch inside
-        _finalize_json().
+        _json_safe() NaN/Inf handling.
         """
         if not self.save_per_trial_json:
             return ""
