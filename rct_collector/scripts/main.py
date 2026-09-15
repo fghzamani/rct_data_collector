@@ -112,6 +112,16 @@ def parse_args():
     p.add_argument("--probe-goal-distance", type=float, default=2.5,
                    help="Campaign A: distance (m) of the short local goToPose "
                         "goal, straight ahead of each probe's start pose")
+    p.add_argument("--constriction", type=str, default=None,
+                   choices=["true", "enriched", "rooms"],
+                   help="Campaign A pose generation: 'true' for constriction-crossing, "
+                        "'enriched' for 3-stratum enriched sampling, 'rooms' for v2 room topology")
+    p.add_argument("--doorway-weight", type=float, default=0.40,
+                   help="Weight for doorway stratum in v2 rooms pose sampling")
+    p.add_argument("--wall-weight", type=float, default=0.25,
+                   help="Weight for wall-following stratum in v2 rooms pose sampling")
+    p.add_argument("--open-weight", type=float, default=0.35,
+                   help="Weight for open control stratum in v2 rooms pose sampling")
     p.add_argument("--no-randomize-arm", dest="randomize_arm",
                    action="store_false", default=True,
                    help="Campaign A: hold the arm at the baseline's captured "
@@ -228,10 +238,22 @@ def main():
         # Generate poses mode
         if args.generate_poses is not None:
             poses_path = os.path.join(args.output, "presampled_poses.json")
+            constriction_val = args.constriction if args.constriction else False
+            if constriction_val == "true":
+                constriction_val = True
+            ckwargs = {
+                "strata_weights": {
+                    "doorway": args.doorway_weight,
+                    "wall": args.wall_weight,
+                    "open": args.open_weight,
+                }
+            }
             poses = sampler.generate_and_save(
                 args.generate_poses, poses_path,
                 campaign=args.campaign,
                 forward_distance_m=args.probe_goal_distance,
+                constriction=constriction_val,
+                constriction_kwargs=ckwargs,
             )
 
             # Also save a visualization with the generated poses
@@ -262,6 +284,22 @@ def main():
     if args.config:
         with open(args.config) as f:
             config = _config_from_yaml(yaml.safe_load(f) or {})
+        # Apply explicit CLI overrides if supplied
+        if args.presampled_poses:
+            config.presampled_poses_path = args.presampled_poses
+        if args.presampled_configs:
+            config.presampled_configs_path = args.presampled_configs
+        if args.output:
+            config.output_dir = args.output
+        if args.map:
+            config.map_yaml_path = args.map
+        if args.campaign:
+            config.campaign = args.campaign
+        if args.n_probes and args.campaign == "A":
+            config.num_trials = args.n_probes
+        elif args.trials and args.campaign == "B":
+            config.num_trials = args.trials
+
     else:
         # --n-probes maps onto the same num_trials field --trials uses for
         # Campaign B, so run()'s loop bound needs no campaign-specific

@@ -667,11 +667,11 @@ class OptimizedRiskStateNode(Node):
         return float(np.mean(local_window == 254))
     
     def _compute_r_width(self) -> float:
-        """R_width: Corridor width perpendicular to heading."""
+        """R_width: Corridor width perpendicular to heading and along lookahead corridor."""
         ranges = self.sensor_state.scan_ranges
         angles = self.sensor_state.scan_angles
 
-        if angles is None:
+        if angles is None or ranges is None:
             return self.config.default_r_width
 
         robot_yaw = self.sensor_state.robot_yaw
@@ -684,7 +684,7 @@ class OptimizedRiskStateNode(Node):
         # World-frame angles
         world_angles = angles + robot_yaw
 
-        # Left perpendicular (robot_yaw + 90°)
+        # 1. Current lateral width at robot position (perpendicular left/right)
         left_angle = robot_yaw + np.pi / 2
         left_diff = np.abs(np.mod(world_angles - left_angle + np.pi, 2 * np.pi) - np.pi)
         left_mask = left_diff < self.config.lateral_tolerance
@@ -693,7 +693,6 @@ class OptimizedRiskStateNode(Node):
                   if len(left_ranges) > 0 and np.any(np.isfinite(left_ranges))
                   else np.inf)
 
-        # Right perpendicular (robot_yaw - 90°)
         right_angle = robot_yaw - np.pi / 2
         right_diff = np.abs(np.mod(world_angles - right_angle + np.pi, 2 * np.pi) - np.pi)
         right_mask = right_diff < self.config.lateral_tolerance
@@ -702,14 +701,41 @@ class OptimizedRiskStateNode(Node):
                    if len(right_ranges) > 0 and np.any(np.isfinite(right_ranges))
                    else np.inf)
 
-        # Corridor width is sum of left and right clearance
         if np.isinf(d_left) and np.isinf(d_right):
-            return self.config.default_r_width
-        if np.isinf(d_left):
-            return float(2 * d_right)
-        if np.isinf(d_right):
-            return float(2 * d_left)
-        return float(d_left + d_right)
+            w_curr = self.config.default_r_width
+        elif np.isinf(d_left):
+            w_curr = float(2 * d_right)
+        elif np.isinf(d_right):
+            w_curr = float(2 * d_left)
+        else:
+            w_curr = float(d_left + d_right)
+
+        # 2. Anticipatory lookahead corridor width ahead (0.2m <= x_rel <= look_ahead_distance)
+        x_rel = valid_ranges * np.cos(angles)
+        y_rel = valid_ranges * np.sin(angles)
+        look_ahead = getattr(self.config, "look_ahead_distance", 3.0)
+
+        fwd_mask = (x_rel >= 0.2) & (x_rel <= look_ahead) & np.isfinite(valid_ranges)
+        if np.any(fwd_mask):
+            y_fwd = y_rel[fwd_mask]
+            left_fwd = y_fwd[y_fwd >= 0.15]
+            right_fwd = np.abs(y_fwd[y_fwd <= -0.15])
+
+            d_left_fwd = np.min(left_fwd) if len(left_fwd) > 0 else np.inf
+            d_right_fwd = np.min(right_fwd) if len(right_fwd) > 0 else np.inf
+
+            if np.isinf(d_left_fwd) and np.isinf(d_right_fwd):
+                w_ahead = self.config.default_r_width
+            elif np.isinf(d_left_fwd):
+                w_ahead = float(2 * d_right_fwd)
+            elif np.isinf(d_right_fwd):
+                w_ahead = float(2 * d_left_fwd)
+            else:
+                w_ahead = float(d_left_fwd + d_right_fwd)
+        else:
+            w_ahead = self.config.default_r_width
+
+        return float(min(w_curr, w_ahead))
         
     
     def _compute_r_clear(self) -> float:

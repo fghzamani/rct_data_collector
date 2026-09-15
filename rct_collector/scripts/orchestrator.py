@@ -41,6 +41,39 @@ from rct_collector.trial_runner import TrialRunner, TrialResult
 logger = logging.getLogger(__name__)
 
 
+# ── Geometry helpers for the remaining-distance trigger ──────────────────
+
+def _remaining_path_length(plan, xy):
+    """Arclength from the robot's projection onto the plan to the plan's end.
+
+    Projects onto the nearest segment (not vertex), so the value falls smoothly.
+    ``plan`` is [[x, y, yaw], ...] from get_probe_planned_path().
+    """
+    P = np.asarray([[p[0], p[1]] for p in plan], dtype=float)
+    if len(P) < 2:
+        return 0.0
+    seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    L = float(s[-1])
+    A, B = P[:-1], P[1:]
+    AB = B - A
+    denom = np.einsum("ij,ij->i", AB, AB)
+    denom[denom == 0] = 1e-12
+    t = np.clip(np.einsum("ij,ij->i", np.asarray(xy) - A, AB) / denom, 0.0, 1.0)
+    proj = A + t[:, None] * AB
+    i = int(np.argmin(np.linalg.norm(proj - np.asarray(xy), axis=1)))
+    s_robot = s[i] + t[i] * np.linalg.norm(AB[i])
+    return float(max(0.0, L - s_robot))
+
+
+def _plan_total_length(plan):
+    """Total arclength of a plan [[x, y, yaw], ...]."""
+    P = np.asarray([[p[0], p[1]] for p in plan], dtype=float)
+    if len(P) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1)))
+
+
 @dataclass
 class OrchestratorConfig:
     """Configuration for the RCT orchestrator."""
@@ -55,7 +88,7 @@ class OrchestratorConfig:
 
     min_goal_distance: float = 3.0
     max_goal_distance: float = 15.0
-    obstacle_clearance_m: float = 0.5
+    obstacle_clearance_m: float = 0.85
     sampling_bounds: Optional[dict] = None
 
     output_dir: str = "./rct_data"
@@ -147,13 +180,15 @@ class OrchestratorConfig:
     arm_control_mode: str = "joint_trajectory"  # default mode; per-pose "mode" overrides
     arm_action: str = "/arm_controller/follow_joint_trajectory"
     play_motion_action: str = "/play_motion2"
-    arm_move_time_sec: float = 1.0
+    arm_move_time_sec: float = 4.0   # measured tucked->carry duration; the
+                                     # enriched pose sampler must use the SAME
+                                     # value as arm_settle_sec for its window.
     arm_move_on_change_only: bool = True  # only re-move the arm when the label changes
     # Confirm the arm physically arrived by comparing /joint_states against the
     # ARM_CONFIGS joint targets. An action reporting SUCCEEDED is not proof.
     verify_arm_joints: bool = True
     arm_joint_tolerance_rad: float = 0.15
-    arm_settle_sec: float = 1.0
+    arm_settle_sec: float = 4.0      # must match arm_move_time_sec
 
     # --- Campaign selection ------------------------------------------------
     # "B" (default): current full-mission behavior, unchanged.
@@ -164,11 +199,66 @@ class OrchestratorConfig:
     # identification, only that it is fixed and applied before every R
     # snapshot.
     campaign: str = "B"
-    horizon_sec: float = 3.0            # how long to watch for a collision after do(C=c)
+    horizon_sec: float = 8.0            # how long to watch for a collision after do(C=c).
+                                        # MUST exceed arm_move_time_sec (4 s) with room to
+                                        # spare, or the arm is still unfolding when the
+                                        # horizon ends and no carry collision can occur.
     baseline_settle_sec: float = 2.0    # how long to drive under baseline before snapshotting R
     washout_sec: float = 2.0            # pause after reverting to baseline, before the next probe
     randomize_arm: bool = True          # if False, c's footprint is forced to the baseline's label
-    probe_forward_distance_m: float = 2.5   # local goToPose target, straight ahead of the probe start
+    probe_forward_distance_m: float = 5.0   # goal distance; longer = more runway, zero wall-clock cost
+
+    # ── Application trigger (remaining-distance protocol) ────────────────
+    # The trigger fires when remaining path length crosses a uniformly drawn
+    # threshold, guaranteeing v_max*H + tol of runway after apply.
+    v_max_mps: float = 0.50           # fastest speed any c can deliver (smoother cap)
+    goal_tolerance_m: float = 0.25    # Nav2 xy_goal_tolerance
+    trigger_margin_m: float = 0.25    # slack on the guard
+    t_min_baseline_m: float = 0.40
+    trigger_early_frac: float = 0.25   # fraction of the admissible band, at the
+                                       # EARLY end, from which the trigger is drawn.
+                                       # 1.0 = the old uniform-over-band behaviour.    # min distance under baseline before trigger
+    t_apply_cap_sec: float = 15.0     # give up waiting if trigger never fires
+    plan_wait_sec: float = 3.0        # wait for Nav2 to publish a plan
+
+    # ── Early time-based apply (alternative to the remaining-distance trigger)
+    # When apply_mode == "early_time", c is applied at a random wall of
+    # t ~ Uniform(t_apply_min_sec, t_apply_max_sec) after the drive starts,
+    # independent of geometry, so the arm opens near the start pose and the
+    # robot then carries it through as much of the path as the horizon covers.
+    # Identification is unchanged: apply time is a clock, independent of R, and
+    # C is still drawn independently.
+    apply_mode: str = "distance"      # "distance" (default) or "early_time"
+    t_apply_min_sec: float = 1.5
+    t_apply_max_sec: float = 3.0
+    # With early apply the start pose is in clearance, so the collision
+    # opportunity is DOWN the path. Watch long enough to reach it: the horizon
+    # is extended to cover the remaining planned path, capped here so a very
+    # long plan does not make a single probe run forever.
+    cover_remaining_path: bool = True
+    horizon_cap_sec: float = 20.0
+
+    # ── Arm-transition footprint policy ─────────────────────────────────
+    # The physical arm takes ~arm_move_time_sec to reach carry. The local
+    # costmap footprint can be handled three ways during that transition:
+    #   "track_arm" (default, realistic): footprint follows the VERIFIED
+    #       physical arm. While the arm is opening the costmap stays tucked,
+    #       so MPPI drives confidently into the gap and the opening arm hits.
+    #       This is the real latency failure and the one the model must learn.
+    #   "hold_tucked": footprint stays tucked for the whole horizon. The
+    #       planner never avoids anything; maximises the observed collision
+    #       rate. Use to build up positive examples, but note the costmap no
+    #       longer indicates the arm state — group on arm_verified_* instead.
+    #   "instant" (old behaviour): footprint jumps to carry at apply. The
+    #       2D planner treats the robot as big before the arm is, and steers
+    #       away from doorways, suppressing the collision.
+    footprint_policy: str = "track_arm"
+    # Arm openness (0=tucked .. 1=carry target) above which "track_arm" flips
+    # the local costmap to the carry polygon.
+    arm_openness_carry_threshold: float = 0.60
+    # Poll period for the interleaved arm/footprint/collision watch.
+    transition_poll_sec: float = 0.05
+
     cmd_vel_topic: str = "/mobile_base_controller/cmd_vel"  # only used by --baseline-nudge
     # See TrialRunner._publish_nudge(): under the active-drive probe design the
     # robot is already moving via MPPI during baseline_settle_sec, so R should
@@ -294,12 +384,16 @@ class RCTOrchestrator:
     def _init_param_applier(self):
         import rclpy
         from rclpy.node import Node
+        from nav2_msgs.msg import SpeedLimit
 
         from rct_collector.scripts.param_applier import ParamApplier
 
         if not rclpy.ok():
             rclpy.init()
         self._param_node = Node("rct_param_applier")
+        # This publisher is used by _apply_params for the initial one-shot
+        # publish. The hold timer uses a separate node+publisher (below).
+        self.speed_limit_pub = self._param_node.create_publisher(SpeedLimit, "/speed_limit", 10)
         self.param_applier = ParamApplier(
             self._param_node,
             service_timeout_sec=self.config.param_service_timeout_sec,
@@ -307,7 +401,93 @@ class RCTOrchestrator:
             readback_backoff_sec=self.config.param_readback_backoff_sec,
             settle_sec=self.config.param_settle_sec,
         )
-        logger.info("Parameter applier ready (rclpy service clients) ✓")
+
+        # Separate node + executor for the speed-limit hold timer.
+        # Must NOT be _param_node — ParamApplier uses spin_until_future_complete
+        # on _param_node, which internally creates a temporary executor and
+        # steals the node from any background executor it was added to. Once
+        # stolen, the background thread loses the node and the timer never
+        # fires again. A dedicated node avoids this entirely.
+        import threading
+        self._sl_node = Node("rct_speed_limit_hold")
+        self._sl_pub = self._sl_node.create_publisher(SpeedLimit, "/speed_limit", 10)
+        self._sl_executor = rclpy.executors.SingleThreadedExecutor()
+        self._sl_executor.add_node(self._sl_node)
+        self._sl_thread = threading.Thread(target=self._sl_executor.spin, daemon=True)
+        self._sl_thread.start()
+        self._sl_hold_timer = None
+        self._held_speed_limit_pct = None
+
+        logger.info("Parameter applier ready (rclpy service clients + /speed_limit publisher) ✓")
+
+    # ── Speed-limit hold ────────────────────────────────────────────────
+
+    def _start_speed_limit_hold(self, speed_limit_pct: float):
+        """Republish the speed limit at 5 Hz on a dedicated node+executor.
+
+        Uses _sl_node (not _param_node) so ParamApplier's
+        spin_until_future_complete cannot steal the node from the background
+        executor.
+        """
+        from nav2_msgs.msg import SpeedLimit
+
+        self._stop_speed_limit_hold()
+        self._held_speed_limit_pct = speed_limit_pct
+
+        def _tick():
+            msg = SpeedLimit()
+            msg.header.stamp = self._sl_node.get_clock().now().to_msg()
+            msg.header.frame_id = "map"
+            msg.percentage = True
+            msg.speed_limit = float(self._held_speed_limit_pct)
+            self._sl_pub.publish(msg)
+
+        _tick()  # publish immediately
+        self._sl_hold_timer = self._sl_node.create_timer(0.2, _tick)
+
+    def _stop_speed_limit_hold(self):
+        """Cancel the speed-limit hold."""
+        if self._sl_hold_timer is not None:
+            self._sl_hold_timer.cancel()
+            self._sl_hold_timer = None
+        self._held_speed_limit_pct = None
+
+    # ── Remaining-distance trigger helpers ──────────────────────────────
+
+    def _guard_distance(self) -> float:
+        """Minimum remaining-path after apply so the horizon is never truncated."""
+        c = self.config
+        return c.v_max_mps * float(c.horizon_sec) + c.goal_tolerance_m + c.trigger_margin_m
+
+    def _wait_for_plan(self, timeout_sec: float):
+        """Block until Nav2 publishes a plan. Returns (plan, total_length)."""
+        t0 = self.trial_runner.now_sec()
+        while self.trial_runner.now_sec() - t0 < timeout_sec:
+            plan = self.trial_runner.get_probe_planned_path()
+            if plan and len(plan) >= 2:
+                return plan, _plan_total_length(plan)
+            time.sleep(0.05)
+        return [], 0.0
+
+    def _draw_trigger_distance(self, d_total: float):
+        """Draw a remaining-distance trigger uniformly in the admissible window.
+
+        Returns the remaining-distance threshold s_apply: fire when
+        remaining_path_length <= s_apply. Returns None if the plan is too short.
+        """
+        s_lo = self._guard_distance()
+        s_hi = d_total - self.config.t_min_baseline_m
+        if s_hi <= s_lo:
+            return None
+        # Apply as early as the protocol allows, so the arm finishes unfolding
+        # with most of the horizon still ahead. Larger remaining-distance =
+        # earlier trigger, so we draw near s_hi. The draw stays random (it
+        # still varies the sampled context) but is confined to the early
+        # part of the admissible band. Identification is unaffected: this
+        # changes WHICH contexts are sampled, not P(C|R), which stays uniform.
+        early_frac = float(getattr(self.config, "trigger_early_frac", 0.25))
+        u = float(self.pose_sampler.rng.uniform(max(0.0, 2.0 - early_frac), 2.0))
+        return s_lo + u * (s_hi - s_lo)
 
     def _verify_goal_tolerance(self):
         """Warn loudly if the runner's success criterion disagrees with Nav2's.
@@ -364,6 +544,10 @@ class RCTOrchestrator:
 
         baseline: dict = {}
         for p in self.param_space.params:
+            if getattr(p, "apply_via", "") == "speed_limit_topic":
+                baseline.setdefault(p.node, {})[p.name] = 100.0
+                continue
+
             value, _declared_type, err = self.param_applier.get(p.ros_node, p.name)
             if err:
                 raise RuntimeError(
@@ -403,15 +587,12 @@ class RCTOrchestrator:
             )
         logger.info("  /navigate_to_pose found ✓")
 
-        # Smoke-test dynamic reconfig
-        result = subprocess.run(
-            ["ros2", "param", "get", "/controller_server", "controller_frequency"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            logger.info(f"  Dynamic reconfig works ✓ ({result.stdout.strip()})")
+        # Smoke-test dynamic reconfig via ParamApplier client
+        val, _dtype, err = self.param_applier.get("controller_server", "controller_frequency")
+        if not err:
+            logger.info(f"  Dynamic reconfig works ✓ (controller_frequency={val})")
         else:
-            logger.warning("  Could not read /controller_server params")
+            logger.warning(f"  Could not read /controller_server params ({err})")
 
     def _load_presampled(self):
         """Load pre-generated configs/poses and build an explicit index map.
@@ -440,8 +621,12 @@ class RCTOrchestrator:
                 setattr(self, attr, loaded)
                 logger.info(f"Loaded {len(loaded)} {label} from {path}")
 
-        rng = np.random.default_rng(self.config.seed)
         n = self.config.num_trials
+        if self.presampled_configs is None:
+            logger.info(f"Pre-generating balanced LHS configurations ({n} samples)...")
+            self.presampled_configs = self.param_space.sample_lhs(n)
+
+        rng = np.random.default_rng(self.config.seed)
 
         self._pose_index_map = self._build_index_map(
             "poses", self.presampled_poses, n, self.config.allow_pose_reuse, rng)
@@ -506,6 +691,13 @@ class RCTOrchestrator:
                     "baseline_config": self._baseline_config,
                 }, f)
             logger.info(f"Assignment map written to {path}")
+            if self.config.presampled_poses_path:
+                src_png = os.path.join(os.path.dirname(self.config.presampled_poses_path), "presampled_poses_pal_office.png")
+                if os.path.exists(src_png):
+                    import shutil
+                    dst_png = os.path.join(self.config.output_dir, "presampled_poses_pal_office.png")
+                    shutil.copy(src_png, dst_png)
+                    logger.info(f"Copied pose visualization plot to {dst_png}")
         except OSError as e:
             logger.warning(f"Could not write assignment map: {e}")
 
@@ -664,90 +856,275 @@ class RCTOrchestrator:
             not any(o.breaks_integrity for o in self._last_baseline_outcomes))
         result.baseline_config = baseline_flat
 
-        # 2. Pose + start driving under baseline.
-        if self.presampled_poses is not None:
-            pose_idx = (self._pose_index_map[idx]
-                        if self._pose_index_map is not None else idx)
-            self._last_pool_indices["pose"] = pose_idx
-            entry = self.presampled_poses[pose_idx]
-            start_pose, goal_pose = entry["start"], entry["goal"]
-        else:
-            start_pose, goal_pose = self.pose_sampler.sample_probe_pose(
-                self.config.probe_forward_distance_m)
-        result.start_x, result.start_y, result.start_yaw = (
-            start_pose["x"], start_pose["y"], start_pose["yaw"])
-        result.probe_goal_pose = goal_pose
-        logger.info(
-            f"  Probe {probe_id}: start ({start_pose['x']:.2f}, "
-            f"{start_pose['y']:.2f}) -> local goal ({goal_pose['x']:.2f}, "
-            f"{goal_pose['y']:.2f})")
+        # 2 & 3. Pose + drive under baseline; retry on teleport fail,
+        #        baseline collision, or plan too short for the trigger guard.
+        s_apply = None
+        d_total = 0.0
+        for attempt in range(5):
+            if self.presampled_poses is not None:
+                pose_idx = (self._pose_index_map[idx]
+                            if self._pose_index_map is not None else idx)
+                self._last_pool_indices["pose"] = pose_idx
+                entry = self.presampled_poses[pose_idx]
+                start_pose, goal_pose = entry["start"], entry["goal"]
+            else:
+                start_pose, goal_pose = self.pose_sampler.sample_probe_pose(
+                    self.config.probe_forward_distance_m)
+            result.start_x, result.start_y, result.start_yaw = (
+                start_pose["x"], start_pose["y"], start_pose["yaw"])
+            result.probe_goal_pose = goal_pose
 
-        result.teleport_ok = int(self.trial_runner.start_probe_drive(
-            start_pose, goal_pose, nudge=self.config.baseline_nudge))
+            teleport_ok = self.trial_runner.start_probe_drive(
+                start_pose, goal_pose, nudge=self.config.baseline_nudge)
+            result.teleport_ok = int(teleport_ok)
 
-        # 3. Settle under baseline, watched for a baseline-phase collision.
-        baseline_collided, baseline_collision_t = self.trial_runner.watch_probe_collision(
-            self.config.baseline_settle_sec)
-        if baseline_collided:
+            if not teleport_ok:
+                logger.warning(
+                    f"  Probe {probe_id}: teleport unverified on attempt "
+                    f"{attempt+1} — retrying pose...")
+                self.trial_runner.stop_probe_drive()
+                time.sleep(1.0)
+                continue
+
+            # Wait for Nav2 to produce a plan, then check runway.
+            plan, d_total = self._wait_for_plan(self.config.plan_wait_sec)
+            if not plan:
+                logger.warning(
+                    f"  Probe {probe_id}: no plan on attempt {attempt+1}"
+                    " — retrying pose...")
+                self.trial_runner.stop_probe_drive()
+                time.sleep(1.0)
+                continue
+
+            # In early-time mode the treatment lands near the start, so the
+            # full remaining-distance guard is not required; any plan long
+            # enough to drive t_apply_max under baseline is admissible. Only
+            # the distance mode needs the guard runway after apply.
+            if getattr(self.config, "apply_mode", "distance") == "early_time":
+                min_plan = self.config.v_max_mps * self.config.t_apply_max_sec
+                s_apply = float("inf")   # unused in early mode
+                if d_total < min_plan:
+                    logger.warning(
+                        f"  Probe {probe_id}: plan {d_total:.2f} m < "
+                        f"{min_plan:.2f} m needed to reach t_apply — retrying...")
+                    result.n_short_plan_rejects += 1
+                    self.trial_runner.stop_probe_drive()
+                    time.sleep(1.0)
+                    continue
+            else:
+                s_apply = self._draw_trigger_distance(d_total)
+                if s_apply is None:
+                    logger.warning(
+                        f"  Probe {probe_id}: plan {d_total:.2f} m < guard "
+                        f"{self._guard_distance():.2f} m on attempt {attempt+1}"
+                        " — retrying pose...")
+                    result.n_short_plan_rejects += 1
+                    self.trial_runner.stop_probe_drive()
+                    time.sleep(1.0)
+                    continue
+
+            baseline_collided, baseline_collision_t = \
+                self.trial_runner.watch_probe_collision(
+                    self.config.baseline_settle_sec)
+            if not baseline_collided:
+                result.d_total_plan_m = d_total
+                result.s_apply_target_m = s_apply
+                result.d_guard_m = self._guard_distance()
+                break
+
             logger.warning(
-                f"  Probe {probe_id}: collision DURING baseline settle "
-                f"(t={baseline_collision_t:.2f}s) — R was never validly "
-                "snapshotted under a clean pre-treatment state. Aborting probe.")
+                f"  Probe {probe_id}: baseline collision on attempt "
+                f"{attempt+1} (t={baseline_collision_t:.2f}s) — retrying...")
             self.trial_runner.stop_probe_drive()
-            result.status = "BASELINE_COLLISION"
-            result.failure_reason = "BASELINE_COLLISION"
-            result.collision = True
-            result.y_h = None
-            self._last_param_outcomes = []
+            time.sleep(1.0)
+        else:
+            # All attempts exhausted.
+            logger.error(f"  Probe {probe_id}: all pose attempts failed.")
+            result.no_switch = True
+            result.status = "POSE_EXHAUSTED"
+            self.trial_runner.stop_probe_drive()
+            self._stop_speed_limit_hold()
             self._finalize_probe(result, probe_id)
             time.sleep(self.config.washout_sec)
             return result
 
-        # 4. Snapshot R — the frozen pre-treatment state.
-        result.risk_state_snapshot = self.trial_runner.get_risk_snapshot()
-        result.r_snapshot_time = self.trial_runner.now_sec()
-        result.localization_error_m = self.trial_runner.get_localization_error()
-        if result.risk_state_snapshot is None:
-            logger.warning(
-                f"  Probe {probe_id}: no risk state available at snapshot "
-                "time (collect_risk_features off, or environment_risk_node "
-                "not publishing yet?).")
+        # 4–5. In-motion trigger (remaining-distance or early-time).
+        if getattr(self.config, "in_motion", True):
+            t0 = self.trial_runner.now_sec()
+            applied = False
+            t_apply_actual = 0.0
+            self._probe_horizon_sec = self.config.horizon_sec
+            self._probe_latency_meta = None
+            self._pending_probe_params = None
 
-        # 5. Sample + apply the random config c = do(C=c).
-        if self.presampled_configs is not None:
-            cfg_idx = (self._config_index_map[idx]
-                       if self._config_index_map is not None else idx)
-            self._last_pool_indices["config"] = cfg_idx
-            params = self.presampled_configs[cfg_idx]
+            # Sample config from pre-balanced LHS pool.
+            if self.presampled_configs is not None:
+                cfg_idx = (self._config_index_map[idx]
+                           if self._config_index_map is not None else idx)
+                self._last_pool_indices["config"] = cfg_idx
+                params = self.presampled_configs[cfg_idx]
+            else:
+                params = self.param_space.sample()
+
+            if not self.config.randomize_arm:
+                arm_pd = next((p for p in self.param_space.params
+                               if getattr(p, "apply_via", "") == "footprint"),
+                              None)
+                if arm_pd is not None:
+                    bl = self._baseline_config.get(
+                        arm_pd.node, {}).get(arm_pd.name)
+                    if bl is not None:
+                        params = {**params,
+                                  arm_pd.node: {**params[arm_pd.node],
+                                                arm_pd.name: bl}}
+
+            # Draw the apply instant. In "early_time" mode this is a random
+            # wall-clock delay near the start pose; in "distance" mode the
+            # trigger fires when remaining planned path crosses s_apply.
+            early_time = (getattr(self.config, "apply_mode", "distance")
+                          == "early_time")
+            t_apply_target = None
+            if early_time:
+                t_apply_target = float(self.pose_sampler.rng.uniform(
+                    self.config.t_apply_min_sec, self.config.t_apply_max_sec))
+
+            # Poll until the trigger fires or the time cap.
+            while True:
+                elapsed = self.trial_runner.now_sec() - t0
+                plan = self.trial_runner.get_probe_planned_path()
+                xy = self.trial_runner.get_current_pose()[:2]
+                s_rem = (_remaining_path_length(plan, xy)
+                         if plan and len(plan) >= 2 else float("inf"))
+
+                if early_time:
+                    fired = elapsed >= t_apply_target
+                else:
+                    fired = np.isfinite(s_rem) and s_rem <= s_apply
+                capped = elapsed >= self.config.t_apply_cap_sec
+
+                if not (fired or capped):
+                    time.sleep(0.02)
+                    continue
+
+                # 4. Snapshot R — frozen, pre-treatment.
+                result.risk_state_snapshot = \
+                    self.trial_runner.get_risk_snapshot()
+                result.r_snapshot_time = self.trial_runner.now_sec()
+                result.localization_error_m = \
+                    self.trial_runner.get_localization_error()
+                if result.localization_error_m > 1.0:
+                    logger.error(
+                        f"  Probe {probe_id}: localization diverged "
+                        f"({result.localization_error_m:.2f} m). Reinitializing AMCL.")
+                    self._reinitialize_amcl(start_pose)  # publish /initialpose at ground truth
+                    result.no_switch = True
+                    result.status = "LOCALIZATION_LOST"
+                    self.trial_runner.stop_probe_drive()
+                    self._stop_speed_limit_hold()
+                    self._finalize_probe(result, probe_id)
+                    time.sleep(self.config.washout_sec)
+                    return result
+                result.d_remaining_at_apply_m = (
+                    s_rem if np.isfinite(s_rem) else float("nan"))
+                if early_time:
+                    result.trigger_reason = "early_time" if fired else "time_cap"
+                else:
+                    result.trigger_reason = "distance" if fired else "time_cap"
+                if d_total > 0 and np.isfinite(s_rem):
+                    result.trigger_fraction = round(
+                        1.0 - result.d_remaining_at_apply_m / d_total, 4)
+
+                # Watch window: in early mode, extend the horizon to cover the
+                # remaining planned path so the tight geometry down the path is
+                # actually observed, not just the clear stretch after the start.
+                self._probe_horizon_sec = self.config.horizon_sec
+                if early_time and getattr(self.config, "cover_remaining_path", True):
+                    v_eff = max(0.15, float(self.config.v_max_mps))
+                    need = (s_rem / v_eff) if np.isfinite(s_rem) else self.config.horizon_sec
+                    self._probe_horizon_sec = float(min(
+                        self.config.horizon_cap_sec,
+                        max(self.config.horizon_sec, need)))
+
+                # 5. Apply c = do(C=c).
+                logger.info(
+                    f"  Probe {probe_id} [IN-MOTION]: applying c at "
+                    f"t={elapsed:.2f}s, s_rem="
+                    f"{result.d_remaining_at_apply_m:.2f} m "
+                    f"(target {s_apply:.2f}, {result.trigger_reason})")
+                # Apply + move arm + watch are now interleaved in step 6 via
+                # _apply_and_watch_transition so the costmap footprint can track
+                # the physical arm through the ~4 s unfold instead of jumping to
+                # carry instantly (which steers MPPI away from the doorway and
+                # suppresses the collision). Stash the config; run it below.
+                self._pending_probe_params = params
+                t_apply_actual = elapsed
+                result.c_apply_time = self.trial_runner.now_sec()
+                result.params = self.param_space.flatten(params)
+                applied = True
+
+                # Hold the speed limit for the full horizon.
+                sl = params.get("controller_server", {}).get(
+                    "speed_limit_pct")
+                if sl is not None:
+                    self._start_speed_limit_hold(sl)
+
+                break
+
+            if not applied:
+                result.no_switch = True
+                result.status = "PROBE_COMPLETE"
+                self.trial_runner.stop_probe_drive()
+                self._stop_speed_limit_hold()
+                self._finalize_probe(result, probe_id)
+                time.sleep(self.config.washout_sec)
+                return result
         else:
-            params = self.param_space.sample()
+            # Legacy static snapshot path
+            result.risk_state_snapshot = self.trial_runner.get_risk_snapshot()
+            result.r_snapshot_time = self.trial_runner.now_sec()
+            result.localization_error_m = self.trial_runner.get_localization_error()
 
-        if not self.config.randomize_arm:
-            arm_pd = next((p for p in self.param_space.params
-                           if getattr(p, "apply_via", "") == "footprint"), None)
-            if arm_pd is not None:
-                baseline_label = self._baseline_config.get(arm_pd.node, {}).get(arm_pd.name)
-                if baseline_label is not None:
-                    params = {**params, arm_pd.node: {**params[arm_pd.node],
-                                                        arm_pd.name: baseline_label}}
+            if self.presampled_configs is not None:
+                cfg_idx = (self._config_index_map[idx]
+                           if self._config_index_map is not None else idx)
+                self._last_pool_indices["config"] = cfg_idx
+                params = self.presampled_configs[cfg_idx]
+            else:
+                params = self.param_space.sample()
 
-        logger.info(f"  Probe {probe_id}: applying c = {self.param_space.flatten(params)}")
-        outcomes = self._apply_params(params)
-        self._last_param_outcomes = outcomes
-        self._log_param_outcomes(outcomes)
-        self._set_arm_for_config(params)
+            if not self.config.randomize_arm:
+                arm_pd = next((p for p in self.param_space.params
+                               if getattr(p, "apply_via", "") == "footprint"), None)
+                if arm_pd is not None:
+                    baseline_label = self._baseline_config.get(arm_pd.node, {}).get(arm_pd.name)
+                    if baseline_label is not None:
+                        params = {**params, arm_pd.node: {**params[arm_pd.node],
+                                                            arm_pd.name: baseline_label}}
 
-        result.c_apply_time = self.trial_runner.now_sec()
-        assert result.c_apply_time >= result.r_snapshot_time, (
-            "do(C=c) timestamped before the R snapshot — pre-treatment-R "
-            "invariant violated.")
-        result.params = self.param_space.flatten(params)
+            logger.info(f"  Probe {probe_id}: applying c = {self.param_space.flatten(params)}")
+            self._pending_probe_params = params
+            result.c_apply_time = self.trial_runner.now_sec()
+            result.params = self.param_space.flatten(params)
 
-        # 6. Watch horizon_sec for collision, on a clean window.
+            sl = params.get("controller_server", {}).get("speed_limit_pct")
+            if sl is not None:
+                self._start_speed_limit_hold(sl)
+
+        # 6. Apply c, move the arm, and watch for collision in ONE interleaved
+        # loop. The costmap footprint tracks the physical arm through the unfold
+        # (config.footprint_policy), so MPPI is not steered away from the
+        # doorway before the arm is actually extended. Latency variables
+        # (transition time, distance during transition, arm openness at
+        # collision) are recorded for the model to learn from.
         h_start_x, h_start_y, _ = self.trial_runner.get_current_pose()
-        self.trial_runner.reset_probe_collision_state()
-        y_h, collision_t = self.trial_runner.watch_probe_collision(self.config.horizon_sec)
+        _probe_H = getattr(self, "_probe_horizon_sec", self.config.horizon_sec)
+        result.horizon_sec = _probe_H
+        pend = getattr(self, "_pending_probe_params", None) or params
+        y_h, collision_t, telemetry, _lat = self._apply_and_watch_transition(
+            pend, _probe_H)
+        self._probe_latency_meta = _lat
         self.trial_runner.stop_probe_drive()
+        self._stop_speed_limit_hold()
         h_end_x, h_end_y, _ = self.trial_runner.get_current_pose()
 
         import math
@@ -755,9 +1132,33 @@ class RCTOrchestrator:
         result.probe_progress_m = progress_m
         result.probe_stalled = int(progress_m < 0.10 and not bool(y_h))
 
+        # Check whether the goal was reached inside H — should be 0 with the
+        # guard in place. If it fires, v_max_mps is set too low.
+        if result.probe_goal_pose:
+            gx = result.probe_goal_pose.get("x", float("nan"))
+            gy = result.probe_goal_pose.get("y", float("nan"))
+            d_to_goal = math.sqrt((h_end_x - gx)**2 + (h_end_y - gy)**2)
+            result.arrived_within_H = int(
+                d_to_goal <= self.config.goal_tolerance_m + 0.1)
+
         result.y_h = y_h
         result.collision = bool(y_h)
         result.collision_time_sec = collision_t
+
+        # Delivery instrumentation metrics (C-4)
+        if telemetry:
+            vxs = [abs(s.get("linear_velocity", [0.0])[0]) for s in telemetry]
+            wzs = [abs(s.get("angular_velocity", [0.0, 0.0, 0.0])[2]) for s in telemetry]
+            scans = [s.get("min_scan_value") for s in telemetry if s.get("min_scan_value") is not None]
+            result.achieved_max_vx = max(vxs) if vxs else 0.0
+            result.achieved_p95_vx = float(np.percentile(vxs, 95)) if vxs else 0.0
+            result.achieved_max_wz = max(wzs) if wzs else 0.0
+            result.achieved_min_obstacle_distance = min(scans) if scans else 99.0
+
+        result.speed_limit_pct_applied = params.get("controller_server", {}).get("speed_limit_pct", 100.0)
+        result.t_apply_sim = t_apply_actual if getattr(self.config, "in_motion", True) else result.c_apply_time
+        result.no_switch = False
+
         if result.probe_stalled:
             result.status = "PROBE_STALLED"
         elif y_h:
@@ -765,9 +1166,6 @@ class RCTOrchestrator:
         else:
             result.status = "PROBE_COMPLETE"
 
-        # Scoped to exactly this horizon window (reset_probe_collision_state()
-        # just above is the start of the scope) — confirms y_h=0 means "no
-        # collision", not "the channel went silent and nothing was observed".
         result.collision_msgs_seen, result.collision_channel_silent = (
             self.trial_runner.get_collision_channel_status())
         if result.collision_channel_silent:
@@ -819,8 +1217,19 @@ class RCTOrchestrator:
             "collision_channel_silent": result.collision_channel_silent,
             "probe_progress_m": result.probe_progress_m,
             "probe_stalled": result.probe_stalled,
+            "d_total_plan_m": result.d_total_plan_m,
+            "s_apply_target_m": result.s_apply_target_m,
+            "d_remaining_at_apply_m": result.d_remaining_at_apply_m,
+            "d_guard_m": result.d_guard_m,
+            "trigger_reason": result.trigger_reason,
+            "trigger_fraction": result.trigger_fraction,
+            "n_short_plan_rejects": result.n_short_plan_rejects,
+            "arrived_within_H": result.arrived_within_H,
             "planned_local_path": self.trial_runner.get_probe_planned_path(),
             "executed_trajectory": self.trial_runner.get_probe_controller_path(),
+            # Arm-transition latency variables (see _apply_and_watch_transition).
+            **{f"lat_{k}": v for k, v in
+               (getattr(self, "_probe_latency_meta", None) or {}).items()},
         }
         result.json_path = self.trial_runner.write_probe_json(payload, probe_id)
 
@@ -865,6 +1274,12 @@ class RCTOrchestrator:
             extra = getattr(p, "extra_targets", None) or []
             ros_node = getattr(p, "ros_node", None) or p.node
 
+            if apply_via == "speed_limit_topic":
+                out = self.param_applier.publish_speed_limit(self.speed_limit_pub, value)
+                out.logical_key = f"{p.node}__{p.name}"
+                outcomes.append(out)
+                continue
+
             if apply_via == "footprint":
                 presets = getattr(p, "presets", None) or {}
                 value = presets.get(value, value)
@@ -904,6 +1319,191 @@ class RCTOrchestrator:
             total_ms = 1000.0 * sum(o.elapsed_sec for o in outcomes)
             logger.info(
                 f"  All {len(outcomes)} params set and verified ✓ ({total_ms:.0f} ms)")
+
+    # ── Arm-transition-aware apply + watch ──────────────────────────────
+    def _arm_param_def(self):
+        return next((p for p in self.param_space.params
+                     if getattr(p, "apply_via", "") == "footprint"), None)
+
+    def _split_footprint(self, params: dict):
+        """Return (software_params, arm_label). software_params is a deep-ish
+        copy of params with the footprint sub-parameter removed, so it can be
+        applied without touching the costmap footprint. arm_label is the
+        requested arm preset ("tucked"/"carry") or None."""
+        arm_pd = self._arm_param_def()
+        if arm_pd is None:
+            return params, None
+        node, name = arm_pd.node, arm_pd.name
+        label = params.get(node, {}).get(name)
+        soft = {k: (dict(v) if isinstance(v, dict) else v)
+                for k, v in params.items()}
+        if node in soft and name in soft[node]:
+            soft[node] = {kk: vv for kk, vv in soft[node].items() if kk != name}
+        return soft, label
+
+    def _push_footprint_label(self, label: str):
+        """Set the LOCAL costmap footprint to the polygon for `label`."""
+        from rct_collector.scripts.param_space import ARM_CONFIGS
+        arm_pd = self._arm_param_def()
+        if arm_pd is None or label not in ARM_CONFIGS:
+            return
+        poly = ARM_CONFIGS[label]["footprint"]
+        ros_node = getattr(arm_pd, "ros_node", None) or arm_pd.node
+        try:
+            self.param_applier.set_and_verify(ros_node, arm_pd.name, poly, "footprint")
+        except Exception as exc:
+            logger.warning(f"  footprint push to '{label}' failed: {exc}")
+
+    def _arm_openness(self, target_label: str) -> float:
+        """Fraction in [0,1] of the way from the tucked joint target to the
+        `target_label` joint target, by the most-lagging joint. 0 = tucked,
+        1 = target reached. None if joint states are unavailable."""
+        from rct_collector.scripts.param_space import ARM_CONFIGS, ARM_JOINT_NAMES
+        pos = self.trial_runner.get_arm_joint_positions(ARM_JOINT_NAMES)
+        if not pos:
+            return None
+        tucked = ARM_CONFIGS["tucked"]["joints"]
+        target = ARM_CONFIGS[target_label]["joints"]
+        fracs = []
+        for n, a, b in zip(ARM_JOINT_NAMES, tucked, target):
+            span = abs(b - a)
+            if span < 1e-6:
+                continue
+            fracs.append(max(0.0, min(1.0, abs(pos.get(n, a) - a) / span)))
+        if not fracs:
+            return 1.0
+        return min(fracs)   # most-lagging joint gates "openness"
+
+    def _start_arm_move_async(self, label: str):
+        """Command the arm to `label` WITHOUT blocking, so the base keeps
+        driving and the collision window can run during the unfold. Returns the
+        subprocess.Popen handle (or None if nothing was launched)."""
+        import subprocess, json as _json
+        from rct_collector.scripts.param_space import ARM_CONFIGS, ARM_JOINT_NAMES
+        cfg = ARM_CONFIGS.get(label) or {}
+        mode = cfg.get("mode", self.config.arm_control_mode)
+        if mode == "play_motion":
+            goal = f"{{motion_name: {cfg.get('motion_name', label)}, skip_planning: false}}"
+            cmd = ["ros2", "action", "send_goal", self.config.play_motion_action,
+                   "play_motion2_msgs/action/PlayMotion", goal]
+        else:
+            joints = cfg.get("joints")
+            if not joints or len(joints) != len(ARM_JOINT_NAMES):
+                logger.warning(f"  async arm '{label}': bad joint target, skipping")
+                return None
+            goal = _json.dumps({"trajectory": {
+                "joint_names": list(ARM_JOINT_NAMES),
+                "points": [{"positions": [float(v) for v in joints],
+                            "time_from_start": {"sec": int(self.config.arm_move_time_sec)}}]}})
+            cmd = ["ros2", "action", "send_goal", self.config.arm_action,
+                   "control_msgs/action/FollowJointTrajectory", goal]
+        try:
+            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            logger.warning(f"  async arm launch failed: {exc}")
+            return None
+
+    def _apply_and_watch_transition(self, params: dict, horizon_sec: float):
+        """Apply c, move the arm, and watch for collision in ONE interleaved
+        loop, with the costmap footprint governed by config.footprint_policy.
+
+        Returns (y_h, collision_t, telemetry, meta) where meta records the
+        latency variables the model learns from:
+            t_arm_command_sim, t_arm_carry_sim (None if never verified),
+            arm_transition_sec, d_during_transition_m,
+            arm_openness_at_collision, footprint_policy.
+        """
+        from rct_collector.scripts.param_space import ARM_CONFIGS
+        rec_now = self.trial_runner.now_sec
+        policy = getattr(self.config, "footprint_policy", "track_arm")
+        thr = float(getattr(self.config, "arm_openness_carry_threshold", 0.60))
+        poll = float(getattr(self.config, "transition_poll_sec", 0.05))
+
+        soft, arm_label = self._split_footprint(params)
+        is_carry = (arm_label == "carry")
+
+        # 1. Apply the software knobs (speed, critics, inflation). Footprint is
+        #    handled below per policy, NOT here.
+        outcomes = self._apply_params(soft)
+        self._last_param_outcomes = outcomes
+        self._log_param_outcomes(outcomes)
+
+        # 2. Footprint at apply, per policy.
+        if policy == "instant":
+            self._push_footprint_label(arm_label or "tucked")
+            footprint_now = arm_label or "tucked"
+        else:
+            # track_arm and hold_tucked both start tucked.
+            self._push_footprint_label("tucked")
+            footprint_now = "tucked"
+
+        # 3. Start the collision window and launch the arm (non-blocking).
+        self.trial_runner.reset_probe_collision_state()
+        h_start = self.trial_runner.get_current_pose()[:2]
+        t0 = rec_now()
+        t_arm_cmd = t0
+        if arm_label:
+            proc = self._start_arm_move_async(arm_label)
+            self._current_arm_label = arm_label
+        else:
+            proc = None
+
+
+        t_arm_carry = None
+        y_h, collision_t, openness_at_coll = 0, None, None
+        telemetry = []
+        rec = self.trial_runner._recorder
+        last_poll = t0
+        rec.record_sample(0.0)
+        while rec_now() - t0 < horizon_sec:
+            now = rec_now()
+            if now - last_poll >= poll:
+                last_poll = now
+                rec.record_sample(0.0)
+                op = self._arm_openness(arm_label) if is_carry else 0.0
+                if is_carry and op is not None and t_arm_carry is None and op >= 0.999:
+                    t_arm_carry = now
+                # track_arm: grow footprint to carry once the arm is mostly open
+                if (policy == "track_arm" and is_carry
+                        and footprint_now == "tucked"
+                        and op is not None and op >= thr):
+                    self._push_footprint_label("carry")
+                    footprint_now = "carry"
+                telemetry.append({
+                    "t": now - t0,
+                    "arm_openness": (op if op is not None else float("nan")),
+                    "footprint": footprint_now,
+                })
+            if rec.is_collided:
+                y_h = 1
+                collision_t = rec_now() - t0
+                op = self._arm_openness(arm_label) if is_carry else 0.0
+                openness_at_coll = op
+                rec.record_sample(0.0)
+                break
+            time.sleep(0.01)
+        rec.record_sample(0.0)
+
+        h_end = self.trial_runner.get_current_pose()[:2]
+        import math
+        d_transition = math.hypot(h_end[0] - h_start[0], h_end[1] - h_start[1])
+        meta = {
+            "footprint_policy": policy,
+            "t_arm_command_sim": t_arm_cmd,
+            "t_arm_carry_sim": t_arm_carry,
+            "arm_transition_sec": (None if t_arm_carry is None else t_arm_carry - t_arm_cmd),
+            "d_during_transition_m": round(d_transition, 3),
+            "arm_openness_at_collision": openness_at_coll,
+            "arm_footprint_final": footprint_now,
+        }
+        # Leave the physical arm where it is; the step-7 revert restores tucked.
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.wait(timeout=max(0.0, self.config.arm_move_time_sec + 5))
+            except Exception:
+                pass
+        return y_h, collision_t, telemetry, meta
 
     def _set_arm_for_config(self, params: dict) -> None:
         """Resolve the footprint/arm label from `params`, move the physical
@@ -1062,13 +1662,16 @@ class RCTOrchestrator:
                 f"{len(ARM_JOINT_NAMES)}."
             )
             return False
-        names = ", ".join(ARM_JOINT_NAMES)
-        pos = ", ".join(str(float(v)) for v in joints)
-        t = int(self.config.arm_move_time_sec)
-        goal = (
-            f"{{trajectory: {{joint_names: [{names}], "
-            f"points: [{{positions: [{pos}], time_from_start: {{sec: {t}}}}}]}}}}"
-        )
+        goal_dict = {
+            "trajectory": {
+                "joint_names": list(ARM_JOINT_NAMES),
+                "points": [{
+                    "positions": [float(v) for v in joints],
+                    "time_from_start": {"sec": int(self.config.arm_move_time_sec)}
+                }]
+            }
+        }
+        goal = json.dumps(goal_dict)
         cmd = ["ros2", "action", "send_goal", self.config.arm_action,
                "control_msgs/action/FollowJointTrajectory", goal]
         return self._send_arm_goal(cmd, label)
@@ -1364,7 +1967,19 @@ class RCTOrchestrator:
         logger.info(f"Summary: {json.dumps(summary, indent=2)}")
 
     def shutdown(self):
-        """Release the parameter-applier node. Safe to call more than once."""
+        """Release all ROS nodes. Safe to call more than once."""
+        self._stop_speed_limit_hold()
+        # Shut down the dedicated speed-limit hold node+executor.
+        if hasattr(self, "_sl_executor") and self._sl_executor is not None:
+            self._sl_executor.shutdown()
+            self._sl_executor = None
+        if hasattr(self, "_sl_node") and self._sl_node is not None:
+            try:
+                self._sl_node.destroy_node()
+            except Exception:
+                pass
+            self._sl_node = None
+        # Shut down the parameter-applier node.
         if self._param_node is not None:
             try:
                 self._param_node.destroy_node()

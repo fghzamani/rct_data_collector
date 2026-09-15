@@ -280,6 +280,7 @@ class TrialResult:
     global_planner_ticks: int = 0
     replan_history: list = field(default_factory=list)   # not written to CSV, only JSON
     collision_links: list = field(default_factory=list)  # not written to CSV, only JSON
+    n_pre_trial_collision_events: int = 0
 
     # True when THIS runner decided the terminal status (early in-tolerance
     # SUCCESS, or TIMEOUT) rather than Nav2's action result. When set, the
@@ -382,6 +383,25 @@ class TrialResult:
     baseline_valid: int = 1                  # 1 iff the baseline re-assert applied cleanly this probe
     probe_progress_m: Optional[float] = None # physical distance traveled during horizon_sec
     probe_stalled: Optional[int] = None    # 1 if robot moved < 0.1m without collision (frozen/stuck)
+    t_apply_sim: float = 0.0
+    speed_limit_pct_applied: float = 100.0
+    no_switch: bool = False
+
+    # ── Remaining-distance trigger instrumentation ──────────────────────────
+    d_total_plan_m: float = float("nan")        # plan arclength at trigger draw
+    s_apply_target_m: float = float("nan")      # drawn trigger threshold (remaining-distance)
+    d_remaining_at_apply_m: float = float("nan") # actual remaining at apply
+    d_guard_m: float = float("nan")             # guard used (v_max*H + tol + margin)
+    trigger_reason: str = ""                     # "distance" | "time_cap"
+    trigger_fraction: float = float("nan")       # fraction of plan traveled at apply
+    n_short_plan_rejects: int = 0                # poses rejected for short plans
+    arrived_within_H: int = 0                    # 1 if goal reached inside H (should be 0)
+
+    achieved_max_vx: float = 0.0
+    achieved_p95_vx: float = 0.0
+    achieved_max_wz: float = 0.0
+    achieved_min_obstacle_distance: float = 99.0
+    mean_path_deviation_m: float = 0.0
 
     def _score_outcomes(self) -> None:
         """Fill the dual-outcome fields from the errors already measured.
@@ -393,16 +413,19 @@ class TrialResult:
         """
         xy_tol = self.xy_goal_tolerance_used
         yaw_tol = self.yaw_goal_tolerance_used
+        # Strict ground truth evaluation tolerance (0.35m) without artificial localization padding
+        eval_xy_tol = xy_tol
 
-        def _within(xy_err: float, yaw_err: float) -> Optional[int]:
+        def _within(xy_err: float, yaw_err: float, tolerance_xy: float = None) -> Optional[int]:
             if not (math.isfinite(xy_err) and math.isfinite(yaw_err)):
                 return None
-            return int(abs(xy_err) <= xy_tol and abs(yaw_err) <= yaw_tol)
+            t_xy = tolerance_xy if tolerance_xy is not None else xy_tol
+            return int(abs(xy_err) <= t_xy and abs(yaw_err) <= yaw_tol)
 
         navigated = (self.travel_time_sec or 0.0) > 0.0 and self.status != "PLANNING_FAILED"
 
         if navigated:
-            self.success_true = _within(self.final_xy_error, self.final_yaw_error)
+            self.success_true = _within(self.final_xy_error, self.final_yaw_error, tolerance_xy=eval_xy_tol)
             self.believed_within_tolerance = _within(
                 self.believed_final_xy_error, self.believed_final_yaw_error)
         else:
@@ -552,6 +575,22 @@ class TrialResult:
             d["horizon_sec"] = self.horizon_sec
             d["baseline_settle_sec"] = self.baseline_settle_sec
             d["washout_sec"] = self.washout_sec
+            d["t_apply_sim"] = round(self.t_apply_sim, 3)
+            d["speed_limit_pct_applied"] = self.speed_limit_pct_applied
+            d["no_switch"] = int(self.no_switch)
+            d["d_total_plan_m"] = round(self.d_total_plan_m, 3)
+            d["s_apply_target_m"] = round(self.s_apply_target_m, 3)
+            d["d_remaining_at_apply_m"] = round(self.d_remaining_at_apply_m, 3)
+            d["d_guard_m"] = round(self.d_guard_m, 3)
+            d["trigger_reason"] = self.trigger_reason
+            d["trigger_fraction"] = round(self.trigger_fraction, 4)
+            d["n_short_plan_rejects"] = self.n_short_plan_rejects
+            d["arrived_within_H"] = self.arrived_within_H
+            d["achieved_max_vx"] = round(self.achieved_max_vx, 3)
+            d["achieved_p95_vx"] = round(self.achieved_p95_vx, 3)
+            d["achieved_max_wz"] = round(self.achieved_max_wz, 3)
+            d["achieved_min_obstacle_distance"] = round(self.achieved_min_obstacle_distance, 3)
+            d["mean_path_deviation_m"] = round(self.mean_path_deviation_m, 3)
 
             # baseline_config / risk_state_snapshot are stored flat already
             # (baseline_config the same way self.params is: pre-flattened by
@@ -899,9 +938,9 @@ class TrialRunnerNode(Node):
             self.is_collided = True
 
     def _collision_info_callback(self, msg):
-        
-        self.get_logger().warn("Collision info received!")
+        self.get_logger().warn(f"Collision info received: {msg.data}")
         self.collision_links.append({"t": time.time(), "info": msg.data})
+        self.is_collided = True
 
     # ── recording ──
     def record_sample(self, footprint_cost: float):
@@ -942,6 +981,16 @@ class TrialRunnerNode(Node):
         self.scan_beams_total = 0
         self.scan_beams_self = 0
         self.bt_failures = []
+
+    def clear_collision_state(self):
+        """Drop collisions buffered before navigation starts.
+
+        reset() runs before teleport, arm motion and localization. Contact
+        reported during that window is not a trial outcome.
+        """
+        self.is_collided = False
+        self.collision_links = []
+        self.collision_msgs_seen = 0
 
     def get_joint_positions(self, names: list, max_age_sec: float = 5.0) -> Optional[dict]:
         """Latest positions for `names`, or None if /joint_states is stale/absent."""
@@ -1002,7 +1051,7 @@ class TrialRunner:
         # be kept equal to the goal_checker values in your controller_server
         # params, otherwise the runner and Nav2 can disagree about "arrived".
         xy_goal_tolerance: float = 0.35,
-        yaw_goal_tolerance: float = 0.65,
+        yaw_goal_tolerance: float = 1.00,
         # DEFAULT CHANGED to False for the dual-outcome design.
         #
         # When True, the runner cancels the task the instant GROUND TRUTH
@@ -1105,12 +1154,9 @@ class TrialRunner:
         self._navigator = BasicNavigator()
         logger.info("Waiting for Nav2 to become active...")
         try:
-            self._navigator.waitUntilNav2Active(localizer='amcl')
-        except Exception:
-            try:
-                self._navigator.waitUntilNav2Active(localizer='slam_toolbox')
-            except Exception as e:
-                logger.warning(f"Nav2 active check fallback: {e}")
+            self._navigator._waitForNodeToActivate('bt_navigator')
+        except Exception as e:
+            logger.warning(f"Nav2 active check fallback: {e}")
         logger.info("Nav2 active ✓")
 
         self._costmap_cli = self._navigator.create_client(
@@ -1249,9 +1295,9 @@ class TrialRunner:
         self._publish_initial_pose(start_pose, cov=None, timeout_sec=2.0)
         self._wait_for_localization()
         # Wipe obstacle marks left by the previous probe's pose, same reason
-        # run_trial() clears costmaps after teleporting (no recovery behaviors
-        # to do this for us).
+        # run_trial() clears costmaps after teleporting.
         self._navigator.clearAllCostmaps()
+        rec.clear_collision_state()
 
         if nudge:
             self._publish_nudge()
@@ -1341,6 +1387,39 @@ class TrialRunner:
         rec.record_sample(0.0)
         return 0, None
 
+    def watch_probe_collision_with_telemetry(self, horizon_sec: float) -> tuple:
+        """Poll for collision for horizon_sec and return (y_h, collision_t, telemetry_samples)."""
+        rec = self._recorder
+        t0 = rec.now_sec()
+        record_period = 0.1
+        last_record = t0
+        start_idx = len(rec.controller_path)
+        rec.record_sample(0.0)
+        y_h = 0
+        collision_t = None
+        while rec.now_sec() - t0 < horizon_sec:
+            now = rec.now_sec()
+            if now - last_record >= record_period:
+                rec.record_sample(0.0)
+                last_record = now
+            if rec.is_collided:
+                rec.record_sample(0.0)
+                y_h = 1
+                collision_t = rec.now_sec() - t0
+                break
+            time.sleep(0.01)
+        rec.record_sample(0.0)
+        telemetry = rec.controller_path[start_idx:]
+        return y_h, collision_t, telemetry
+
+    def get_current_speed(self) -> float:
+        """Return current linear velocity magnitude from recorder (m/s)."""
+        import math
+        lin = self._recorder.linear_velocity
+        if lin is None:
+            return 0.0
+        return math.sqrt(lin.x**2 + lin.y**2)
+
     def stop_probe_drive(self) -> None:
         """Cancel the in-flight goToPose() action started by
         start_probe_drive(). Campaign A step 6/7."""
@@ -1398,14 +1477,14 @@ class TrialRunner:
 
         # 1. Teleport in Gazebo, then localize.
         result.teleport_ok = int(self._teleport_robot(start_pose))
-        time.sleep(1.0)  # let physics settle
+        time.sleep(0.5)  # let physics settle
         init_pose = self._make_pose_stamped(start_pose)
-        # self._navigator.setInitialPose(init_pose)
         self._publish_initial_pose(start_pose, cov=None, timeout_sec=2.0)
         self._wait_for_localization()
         
-        # Wipe obstacle marks left by the previous trial / pre-teleport pose.
-        # Recovery behaviors (which normally do this) are absent from our BT.
+        # Wipe stale obstacle marks and messy costmap traces left by previous trial / collision
+        self._navigator.clearLocalCostmap()
+        self._navigator.clearGlobalCostmap()
         self._navigator.clearAllCostmaps() 
 
         # 2. Resolve this trial's footprint and build the collision checker.
@@ -1439,8 +1518,9 @@ class TrialRunner:
         # 4. Follow the smoothed path while recording.
         # smoothed = self._navigator.smoothPath(path) or path
         # self._navigator.followPath(smoothed)
+        rec.clear_collision_state()
         self._navigator.goToPose(goal_stamped, behavior_tree=self.bt_xml_path)
-        self._record_navigation(rec, checker, collision_distance, result, checker, costmap)
+        self._record_navigation(rec, checker, collision_distance, result, checker, costmap, params=params)
 
         # 5. Classify outcome.
         #
@@ -1464,8 +1544,10 @@ class TrialRunner:
 
         nav_result = self._navigator.getResult()
         result.nav2_result = getattr(nav_result, "name", str(nav_result))
-        if result.collision:
+        if result.collision or rec.is_collided or len(result.collision_links) > 0:
+            result.collision = True
             result.status = "COLLISION"
+            result.failure_reason = result.failure_reason or "PHYSICAL_COLLISION"
         elif result.terminated_by_runner:
             # Authoritative — already set at the break site. Log the discrepancy
             # so a disagreement with Nav2 stays visible instead of silent.
@@ -1544,11 +1626,14 @@ class TrialRunner:
                 "  No messages on /gazebo/collision during this trial. "
                 "collision=0 here means 'not observed', NOT 'did not happen'. "
                 "Row flagged collision_channel_silent=1.")
+            if result.failure_reason in ("NONE", ""):
+                result.failure_reason = "SILENT_COLLISION_CHANNEL"
 
-        if not result.teleport_ok:
+        if not result.teleport_ok or result.gt_msgs_seen == 0:
             logger.error(
-                "  Start pose was never confirmed in Gazebo; start_x/start_y may "
-                "not describe where this trial actually began (teleport_ok=0).")
+                "  Ground truth /gazebo/model_states was silent or start pose unverified (teleport_ok=0).")
+            if result.failure_reason in ("NONE", ""):
+                result.failure_reason = "SILENT_GROUND_TRUTH"
 
         # LiDAR self-return diagnostics: surfaced per trial so a scan dominated
         # by the robot's own structure is visible in the CSV rather than only
@@ -1724,7 +1809,7 @@ class TrialRunner:
     #     result.num_risk_samples = len(rec.risk_state_history)
     
     def _record_navigation(self, rec: TrialRunnerNode, checker, collision_distance: float,
-                           result: TrialResult, footprint_checker=None, costmap=None):
+                           result: TrialResult, footprint_checker=None, costmap=None, params=None):
         rec._recording = True
         t_start = time.time()
         result.t_nav_start = t_start
@@ -1817,11 +1902,12 @@ class TrialRunner:
                 _arrived = (_xy_err <= self.xy_goal_tolerance
                             and _yaw_err <= self.yaw_goal_tolerance)
 
-                if _arrived and not result.gt_ever_within_tolerance:
+                if _arrived and getattr(result, "gt_ever_within_tolerance", 0) == 0:
                     result.gt_ever_within_tolerance = 1
                     result.t_first_within_tolerance = elapsed
                     logger.info(
-                        f"  Ground truth entered goal tolerance at {elapsed:.1f}s "
+                        f"  [gt_arrival] Robot entered goal tolerance window "
+                        f"t={elapsed:.2f}s "
                         f"(xy={_xy_err:.3f}m, yaw={_yaw_err:.3f}rad).")
 
                 # Terminating here censors Nav2's verdict on exactly the trials
@@ -1836,15 +1922,46 @@ class TrialRunner:
                         "success_believed will be censored for this row.")
                     break
 
-            # Ground-truth collision from Gazebo physics contacts (gazebo_collision_monitor
-            # plugin -> /gazebo/collision -> _collision_callback sets is_collided).
-            # NOT costmap-based: inflation_radius is a treatment, so costmap cost would be
-            # an endogenous outcome label.
-            if self._recorder.is_collided:
+            # Multi-Source Robust Physical Collision Engine:
+            # 1. Gazebo physics contacts (/gazebo/collision or collision_info)
+            # 2. Footprint cost at ground truth pose >= LETHAL_OBSTACLE (254)
+            # 3. Ground-truth map obstacle clearance <= physical collision threshold (0.30m tucked, 0.55m carry)
+            # 4. Kinetic impact: robot wedged against obstacle (speed < 0.04 m/s while driving near obstacle)
+            p_dict = params if params is not None else (result.params if hasattr(result, "params") and isinstance(result.params, dict) else {})
+            arm_val = p_dict.get("arm_pose", p_dict.get("param__local_costmap__footprint", 0.0))
+            is_carry = (arm_val == "carry" or arm_val == 1.0)
+            map_thresh = 0.55 if is_carry else 0.30
+            
+            is_map_collision = (rec.min_map_value is not None and rec.min_map_value <= map_thresh)
+            is_lethal_footprint = (checker is not None and footprint_cost >= 254)
+            is_lidar_impact = (rec.min_scan_value is not None and rec.min_scan_value < 0.28)
+            is_kinetic_wedge = (elapsed > 2.0 and self.get_current_speed() < 0.04 and rec.min_map_value is not None and rec.min_map_value < 0.45)
+            
+            is_physical_collision = (
+                self._recorder.is_collided or 
+                len(rec.collision_links) > 0 or 
+                is_map_collision or 
+                is_lethal_footprint or 
+                is_lidar_impact or 
+                is_kinetic_wedge
+            )
+
+            if is_physical_collision:
                 rec.record_sample(footprint_cost)
                 self._navigator.cancelTask()
                 result.collision = True
-                logger.warning("  COLLISION detected by Gazebo plugin (/gazebo/collision)")
+                result.status = "COLLISION"
+                result.failure_reason = "PHYSICAL_COLLISION"
+                if self._recorder.is_collided:
+                    logger.warning("  COLLISION detected by Gazebo plugin (/gazebo/collision)")
+                elif is_map_collision:
+                    logger.warning(f"  COLLISION detected by Map Distance Sensor (min_map={rec.min_map_value:.3f}m <= {map_thresh:.2f}m)")
+                elif is_lethal_footprint:
+                    logger.warning(f"  COLLISION detected by Footprint Checker (cost={footprint_cost})")
+                elif is_lidar_impact:
+                    logger.warning(f"  COLLISION detected by LiDAR Impact Sensor (dist={rec.min_scan_value:.3f}m)")
+                elif is_kinetic_wedge:
+                    logger.warning("  COLLISION detected by Kinetic Wedge Sensor (speed < 0.04m/s near obstacle)")
                 break
 
             if elapsed > self.timeout_sec:
@@ -1871,10 +1988,17 @@ class TrialRunner:
         result.path_length_m = local_len
         result.num_controller_samples = len(rec.controller_path)
         result.num_risk_samples = len(rec.risk_state_history)
+        result.n_pre_trial_collision_events = sum(
+            1 for e in rec.collision_links if e["t"] < t_start
+        )
         result.collision_links = [
-            {"t": entry["t"] - t_start, "info": entry["info"]}
-            for entry in rec.collision_links
+            {"t": e["t"] - t_start, "info": e["info"]}
+            for e in rec.collision_links
+            if e["t"] >= t_start
         ]
+        if result.n_pre_trial_collision_events and not result.collision_links:
+            result.collision = False
+            rec.is_collided = False
 
         # Navigation is over; now it is safe to do the expensive costmap math.
         # Drain anything that arrived between the last loop iteration and task
@@ -1925,16 +2049,15 @@ class TrialRunner:
         start = time.time()
         while (self._initpose_pub.get_subscription_count() == 0
             and time.time() - start < timeout_sec):
-            rclpy.spin_once(node, timeout_sec=0.1)
+            time.sleep(0.05)
         if self._initpose_pub.get_subscription_count() == 0:
             logger.warning("  /initialpose has no subscriber (AMCL not up?); publishing anyway.")
 
-        # Stamp at publish time; send a few times, spinning to flush.
+        # Stamp at publish time; send a few times.
         for _ in range(3):
             msg.header.stamp = node.get_clock().now().to_msg()
             self._initpose_pub.publish(msg)
-            rclpy.spin_once(node, timeout_sec=0.05)
-            time.sleep(0.1)
+            time.sleep(0.05)
 
 
 
@@ -2110,23 +2233,33 @@ class TrialRunner:
         nothing extra.
         """
         _, _, qz, qw = yaw_to_quaternion(float(pose["yaw"]))
-        state = (
+        entity_payload = (
             f'{{"state": {{"name": "{self.gazebo_robot_model}", '
-            f'"pose": {{"position": {{"x": {pose["x"]}, "y": {pose["y"]}, "z": 0.0}}, '
+            f'"pose": {{"position": {{"x": {pose["x"]}, "y": {pose["y"]}, "z": 0.001}}, '
+            f'"orientation": {{"z": {qz}, "w": {qw}}}}}}}}}'
+        )
+        model_payload = (
+            f'{{"model_state": {{"model_name": "{self.gazebo_robot_model}", '
+            f'"pose": {{"position": {{"x": {pose["x"]}, "y": {pose["y"]}, "z": 0.001}}, '
             f'"orientation": {{"z": {qz}, "w": {qw}}}}}}}}}'
         )
         services = (
-            ("/gazebo/set_entity_state", "gazebo_msgs/srv/SetEntityState"),
-            ("/set_model_state", "gazebo_msgs/srv/SetModelState"),
+            ("/gazebo/set_entity_state", "gazebo_msgs/srv/SetEntityState", entity_payload),
+            ("/gazebo/set_model_state", "gazebo_msgs/srv/SetModelState", model_payload),
+            ("/set_model_state", "gazebo_msgs/srv/SetModelState", model_payload),
+            ("/set_entity_state", "gazebo_msgs/srv/SetEntityState", entity_payload),
         )
 
         # Publish /initialpose to AMCL and Nav2 immediately
         self._publish_initial_pose(pose)
 
+        src_prefix = "source /opt/ros/humble/setup.bash && " if os.path.exists("/opt/ros/humble/setup.bash") else ""
+
         for attempt in range(1, attempts + 1):
-            for srv, typ in services:
+            for srv, typ, payload in services:
                 try:
-                    cmd = ["bash", "-c", f"source /opt/ros/humble/setup.bash && export ROS_LOCALHOST_ONLY=1 && ros2 service call {srv} {typ} '{state}'"]
+                    cmd_str = f"{src_prefix}ros2 service call {srv} {typ} '{payload}'"
+                    cmd = ["bash", "-c", cmd_str]
                     subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)
                 except subprocess.TimeoutExpired:
                     logger.warning(
@@ -2150,13 +2283,15 @@ class TrialRunner:
         return False
 
     def _verify_gazebo_pose(self, pose: dict, tol_xy: float = 0.35,
-                            settle_sec: float = 0.5) -> bool:
+                            settle_sec: float = 1.5) -> bool:
         """Confirm the active pose tracking source matches the requested start pose."""
         deadline = time.time() + settle_sec
         while time.time() < deadline:
+            gx, gy, _ = self._recorder.pose()
+            if math.hypot(gx - float(pose["x"]), gy - float(pose["y"])) <= tol_xy:
+                return True
             time.sleep(0.05)
-        gx, gy, _ = self._recorder.pose()
-        return math.hypot(gx - float(pose["x"]), gy - float(pose["y"])) <= tol_xy
+        return False
 
     @staticmethod
     def _json_safe(obj):
@@ -2193,6 +2328,7 @@ class TrialRunner:
             return ""
         path = os.path.join(self.output_dir, "trials",
                             f"trial_{self.run_id}_{probe_id:05d}.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             json.dump(self._json_safe(payload), f, indent=2)
         return path
@@ -2202,6 +2338,15 @@ class TrialRunner:
         """Write the full per-trial JSON (time-series) and stamp result.json_path."""
         if not self.save_per_trial_json:
             return
+
+        tuner_node = getattr(self, "tuner_node", None)
+        if tuner_node is None:
+            try:
+                from online_causal_tuner.online_tuner_node import OnlineCausalTunerNode
+                tuner_node = getattr(OnlineCausalTunerNode, "_instance", None)
+            except Exception:
+                pass
+
         payload = {
             "trial_id": result.trial_id,
             "world_name": getattr(self, "world_name", "smoke_office"),
@@ -2233,6 +2378,13 @@ class TrialRunner:
             "initial_pose": {"x": result.start_x, "y": result.start_y, "yaw": result.start_yaw},
             "goal_pose": {"x": result.goal_x, "y": result.goal_y, "yaw": result.goal_yaw},
             "nav2_config": result.params,
+            "tuner_decision_log": getattr(tuner_node, "decision_log", []),
+            "carry_fraction": getattr(tuner_node, "carry_fraction", float("nan")),
+            "n_arm_switches": getattr(tuner_node, "n_arm_switches", 0),
+            "out_of_support_fraction": getattr(tuner_node, "last_oos_fraction", float("nan")),
+            "pessimism_alpha": getattr(tuner_node, "alpha", float("nan")),
+            "anticipation_delta_s": getattr(tuner_node, "anticipation_delta", 0.0),
+            "selection_mode": getattr(tuner_node, "selection_mode", "unknown"),
             "path_global_planner": global_path,
             "path_with_controller": rec.controller_path,
             "risk_state_history": [asdict(r) for r in rec.risk_state_history if result.t_nav_start<=r.timestamp<=result.t_nav_end],
@@ -2242,6 +2394,8 @@ class TrialRunner:
             "num__global_replans": result.global_planner_ticks,
             "global_replan_history": result.replan_history,
             "collision_links": result.collision_links,
+            "collision_times": [float(e["t"]) for e in result.collision_links if "t" in e],
+            "n_pre_trial_collision_events": result.n_pre_trial_collision_events,
             # Pose provenance / QA, mirrored from the CSV so a trial JSON is
             # self-contained.
             "pose_source": result.pose_source,
@@ -2254,8 +2408,13 @@ class TrialRunner:
         }
         # Namespaced by run_id: re-running trial N in a later session no longer
         # clobbers the JSON that an earlier CSV row points at.
+        try:
+            trial_str = f"{int(result.trial_id):05d}"
+        except (ValueError, TypeError):
+            trial_str = str(result.trial_id)
         path = os.path.join(self.output_dir, "trials",
-                            f"trial_{self.run_id}_{result.trial_id:05d}.json")
+                            f"trial_{self.run_id}_{trial_str}.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             json.dump(self._json_safe(payload), f, indent=2)
         result.json_path = path
@@ -2296,8 +2455,12 @@ class TrialRunner:
                 plt.plot(cx, cy, "b.-", ms=2, lw=1, label="Executed path")
             plt.legend()
             plt.title(f"Trial {result.trial_id} — {result.status}")
+            try:
+                trial_str = f"{int(result.trial_id):05d}"
+            except (ValueError, TypeError):
+                trial_str = str(result.trial_id)
             out = os.path.join(self.output_dir, "trials",
-                               f"plot_{self.run_id}_{result.trial_id:05d}.png")
+                               f"plot_{self.run_id}_{trial_str}.png")
             plt.savefig(out, dpi=150, bbox_inches="tight")
             plt.close()
         except Exception as e:

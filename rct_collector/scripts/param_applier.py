@@ -352,6 +352,25 @@ class ParamApplier:
             out.detail = f"asked={value!r} got={got!r}"
         return out
 
+    def publish_speed_limit(self, pub, speed_limit_pct: float) -> ParamOutcome:
+        """Publish speed limit percentage message on /speed_limit topic."""
+        out = ParamOutcome("controller_server", "speed_limit_pct", speed_limit_pct)
+        t0 = time.time()
+        try:
+            from nav2_msgs.msg import SpeedLimit
+            msg = SpeedLimit()
+            msg.header.stamp = self.node.get_clock().now().to_msg()
+            msg.percentage = True
+            msg.speed_limit = float(speed_limit_pct)
+            pub.publish(msg)
+            out.outcome = OK
+            out.actual = speed_limit_pct
+        except Exception as e:
+            out.outcome = SET_REJECTED
+            out.detail = str(e)
+        out.elapsed_sec = time.time() - t0
+        return out
+
 
 # ── value comparison ─────────────────────────────────────────────────────────
 
