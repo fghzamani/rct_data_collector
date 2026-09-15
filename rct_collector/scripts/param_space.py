@@ -8,42 +8,42 @@ C_t independently of the environment is the core causal-identification
 strategy (do(C=c) is valid because c is assigned by LHS, not by the scene).
 
 ============================================================================
-FINALIZED CONFIGURATION SPACE — 6 parameters, organized by causal channel
+FINALIZED CONFIGURATION SPACE — 7 parameters, organized by causal channel
 ============================================================================
 Confirmed against the live TIAGo stack (nav2_mppi_controller, MPPI):
 
-  Channel        | Variable                   | ROS param
+  Channel        | Variable                   | Delivery Mechanism / ROS param
   ---------------|----------------------------|------------------------------------------
-  dynamics       | max translational velocity | controller_server FollowPath.vx_max
-  dynamics       | max rotational velocity    | controller_server FollowPath.wz_max
-  obstacle resp. | MPPI obstacle critic weight| controller_server FollowPath.CostCritic.cost_weight
-  lookahead      | prediction horizon         | controller_server FollowPath.time_steps
+  dynamics       | speed limit percentage     | /speed_limit topic (percentage msg)
+  dynamics       | MPPI vx sampling noise     | controller_server FollowPath.vx_std
+  dynamics       | MPPI constraint weight     | controller_server FollowPath.ConstraintCritic.cost_weight
+  obstacle resp. | MPPI cost critic weight    | controller_server FollowPath.CostCritic.cost_weight
+  path following | MPPI path alignment weight | controller_server FollowPath.PathAlignCritic.cost_weight
   geometry       | inflation radius           | {local,global}_costmap inflation_layer.inflation_radius
-  geometry       | arm / footprint state      | {local,global}_costmap footprint  (categorical)
+  physical body  | arm / footprint state      | {local,global}_costmap footprint  (categorical)
 
 Notes specific to THIS stack:
 - The obstacle critic is `CostCritic` (not `ObstaclesCritic`); newer Nav2 MPPI
   reads costmap cost directly. It also exposes CostCritic.consider_footprint,
   which is what makes the arm/footprint variable couple into obstacle response.
-- Prediction horizon in seconds = time_steps * model_dt. We vary `time_steps`
-  and hold `model_dt` fixed (see HELD FIXED), so horizon scales linearly and
-  stays interpretable.
 - inflation_radius is treated as ONE causal knob applied to BOTH local and
   global costmaps (linked via extra_targets) so the geometry stays consistent.
   To make it local-only, drop the extra_target on that ParamDef.
 
 ============================================================================
-HELD FIXED (NOT randomized) — by design / per supervisor + Paper 1
+HELD FIXED (NOT randomized) — by design / per supervisor + Paper 1 / Table II
 ============================================================================
+- Max rotational velocity (FollowPath.wz_max): HELD FIXED.
+- Prediction horizon (FollowPath.time_steps): HELD FIXED.
+- Goal and Goal Angle Critics (GoalCritic, GoalAngleCritic): HELD FIXED.
 - Global planner: FIXED (not changed across trials).
 - Controller plugin: FIXED to MPPI (nav2_mppi_controller). Type never changes.
 - controller_server.controller_frequency: FIXED.
 - FollowPath.model_dt, batch_size, iteration_count, temperature, gamma,
   motion_model, and the critic *list* (FollowPath.critics): FIXED — only the
-  obstacle (CostCritic) weight is a treatment; all other critic weights stay
-  at their tuned defaults.
-- cost_scaling_factor: EXCLUDED (Paper 1 found no direct collision effect).
-- min_vel_x / planner tolerance / controller_frequency: EXCLUDED (not in C_t).
+  specified critics are treatments; all other critic weights stay at defaults.
+- cost_scaling_factor: EXCLUDED.
+- min_vel_x / planner tolerance / controller_frequency: EXCLUDED.
 """
 
 import numpy as np
@@ -103,10 +103,7 @@ ARM_JOINT_NAMES = [
 # joints: 7 arm joint targets (radians), captured live and confirmed reachable.
 ARM_CONFIGS = {
     "tucked": {
-        "footprint": (
-            "[[0.30, 0.0], [0.21, 0.21], [0.0, 0.30], [-0.21, 0.21], "
-            "[-0.30, 0.0], [-0.21, -0.21], [0.0, -0.30], [0.21, -0.21]]"
-        ),
+        "footprint": "[[-0.275, 0.000], [-0.238, -0.138], [-0.138, -0.238], [-0.000, -0.275], [0.138, -0.238], [0.209, -0.181], [0.238, -0.138], [0.275, 0.000], [0.252, 0.182], [0.217, 0.242], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]",
         "mode": "play_motion",
         "motion_name": "home",
         "joints": [0.50, -1.34, -0.48, 1.94, -1.49, 1.37, 0.0],
@@ -133,52 +130,58 @@ class ParameterSpace:
 
     # ── Finalized 6-parameter space ─────────────────────────────────────────
     DEFAULT_PARAMS = [
-        # ── Dynamics channel (MPPI velocity caps) ───────────────────────────
+        # ── Speed limit (% of max velocity) applied via /speed_limit topic ───
         ParamDef(
             node="controller_server",
-            name="FollowPath.vx_max",
+            name="speed_limit_pct",
             param_type="continuous",
-            low=0.15, high=0.65,            # CONFIRM vs TIAGo hardware/config max
+            low=30.0, high=95.0,
             channel="dynamics",
+            apply_via="speed_limit_topic",
         ),
+        # ── MPPI sampling noise vx_std ──────────────────────────────────────
         ParamDef(
             node="controller_server",
-            name="FollowPath.wz_max",
+            name="FollowPath.vx_std",
             param_type="continuous",
-            low=0.4, high=1.8,              # MPPI default wz_max ~1.9
+            low=0.15, high=0.40,
             channel="dynamics",
         ),
-
-        # ── Obstacle-response channel (MPPI obstacle critic) ────────────────
+        # ── Constraint critic weight ────────────────────────────────────────
+        ParamDef(
+            node="controller_server",
+            name="FollowPath.ConstraintCritic.cost_weight",
+            param_type="continuous",
+            low=0.5, high=6.0,
+            channel="dynamics",
+        ),
+        # ── Obstacle-response channel (MPPI CostCritic) ─────────────────────
         ParamDef(
             node="controller_server",
             name="FollowPath.CostCritic.cost_weight",
             param_type="continuous",
-            low=1.0, high=12.0,             # default ~3.81; brackets it both ways
+            low=1.0, high=20.0,
             channel="obstacle_response",
         ),
-
-        # ── Lookahead channel (prediction horizon) ──────────────────────────
+        # ── Path alignment channel ──────────────────────────────────────────
         ParamDef(
             node="controller_server",
-            name="FollowPath.time_steps",
-            param_type="discrete",
-            low=30, high=90,                # horizon_sec = time_steps * model_dt (model_dt fixed)
-            channel="lookahead",
+            name="FollowPath.PathAlignCritic.cost_weight",
+            param_type="continuous",
+            low=4.0, high=30.0,
+            channel="path_following",
         ),
-
         # ── Geometry channel: inflation radius (ONE knob, local+global) ─────
         ParamDef(
             node="local_costmap",
             ros_node="local_costmap/local_costmap",
             name="inflation_layer.inflation_radius",
             param_type="continuous",
-            low=0.15, high=0.6,             # live value was 0.55; per-episode (cache rebuild)
+            low=0.15, high=0.60,
             channel="geometry",
             extra_targets=[("global_costmap/global_costmap",
                             "inflation_layer.inflation_radius")],
         ),
-
         # ── Geometry channel: arm / footprint state (categorical) ───────────
         ParamDef(
             node="local_costmap",
@@ -189,7 +192,7 @@ class ParameterSpace:
             channel="footprint",
             apply_via="footprint",
             presets={k: v["footprint"] for k, v in ARM_CONFIGS.items()},
-            extra_targets=[("global_costmap/global_costmap", "footprint")],
+            extra_targets=[],
         ),
     ]
 
@@ -382,8 +385,11 @@ class ParameterSpace:
     def flatten(self, config: dict) -> dict[str, Any]:
         flat = {}
         for node, params in config.items():
-            for name, value in params.items():
-                flat[f"{node}__{name}"] = value
+            if isinstance(params, dict):
+                for name, value in params.items():
+                    flat[f"{node}__{name}"] = value
+            else:
+                flat[node] = params
         return flat
 
     # ── Pre-generation (reproducible, applied one-per-trial) ─────────────────

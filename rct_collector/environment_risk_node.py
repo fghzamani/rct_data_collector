@@ -33,7 +33,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, JointState
 from nav_msgs.msg import Odometry, Path
 from nav2_msgs.msg import Costmap
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -70,6 +70,7 @@ class RiskIndex(IntEnum):
     R_CURVE = 5    # Path curvature
     R_GRAD = 6     # Costmap gradient
     R_VIS = 7      # Visibility risk
+    A_T = 8        # Arm extension state index
 
 
 @dataclass
@@ -105,6 +106,7 @@ class RiskStateConfig:
     scan_angle_mask_deg: tuple = ()     # flat [lo1,hi1,lo2,hi2,...] in LASER frame
     risk_inflation_radius_m: float = 0.3   # FIXED — must not track the treatment
     risk_cost_scaling_factor: float = 10.0
+    v_ref: float = 1.0                  # Reference velocity (m/s) for deconfounded TTC
 
 @dataclass 
 class SensorState:
@@ -139,6 +141,9 @@ class SensorState:
     # Path
     path_points: Optional[np.ndarray] = None
     path_timestamp: float = 0.0
+
+    # Arm state
+    arm_extension_index: float = 0.0
 
 
 @dataclass
@@ -178,7 +183,7 @@ class OptimizedRiskStateNode(Node):
     
     # Feature names for documentation/debugging
     FEATURE_NAMES = ['r_min', 'r_width', 'r_ttc', 'r_dens', 
-                     'r_clear', 'r_curve', 'r_grad', 'r_vis']
+                     'r_clear', 'r_curve', 'r_grad', 'r_vis', 'a_t']
     
     def __init__(self):
         super().__init__('optimized_risk_state_node')
@@ -204,7 +209,7 @@ class OptimizedRiskStateNode(Node):
         self._cycles_degraded = 0
         
         # Previous risk state (for graceful degradation)
-        self._previous_risk_state = np.zeros(8, dtype=np.float32)
+        self._previous_risk_state = np.zeros(9, dtype=np.float32)
         
         # Setup QoS profiles
         sensor_qos = QoSProfile(
@@ -231,6 +236,15 @@ class OptimizedRiskStateNode(Node):
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self._tf_failures = 0
         self._tf_attempts = 0
+
+        # Subscribe to joint states for arm extension tracking
+        self._joint_state_sub = self.create_subscription(
+            JointState,
+            '/joint_states',
+            self._joint_state_cb,
+            sensor_qos,
+            callback_group=self._sensor_cb_group
+        )
 
 
 
@@ -317,6 +331,7 @@ class OptimizedRiskStateNode(Node):
         # the experiment config and report them in the paper.
         self.declare_parameter('risk_inflation_radius_m', 0.30)
         self.declare_parameter('risk_cost_scaling_factor', 10.0)
+        self.declare_parameter('v_ref', 1.0)
     
     
     def _load_config(self) -> RiskStateConfig:
@@ -333,6 +348,7 @@ class OptimizedRiskStateNode(Node):
             scan_angle_mask_deg=tuple(self.get_parameter('scan_angle_mask_deg').value or ()),
             risk_inflation_radius_m=self.get_parameter('risk_inflation_radius_m').value,
             risk_cost_scaling_factor=self.get_parameter('risk_cost_scaling_factor').value,
+            v_ref=self.get_parameter('v_ref').value,
         )
     
     # =========================================================================
@@ -500,6 +516,10 @@ class OptimizedRiskStateNode(Node):
             # 8. R_grad - Costmap gradient (cached)
             result[RiskIndex.R_GRAD] = self._compute_r_grad_cached()
             components_computed.append('r_grad')
+
+        # 9. A_t - Arm extension state index
+        result[RiskIndex.A_T] = self.sensor_state.arm_extension_index
+        components_computed.append('a_t')
         
         # Record final timing
         total_ms = (time.perf_counter() - t_start) * 1000
@@ -571,12 +591,11 @@ class OptimizedRiskStateNode(Node):
         return float(np.min(self.sensor_state.scan_ranges[valid]))
     
     def _compute_r_ttc(self) -> float:
-        """R_ttc: Time to collision at current velocity."""
-        vx = self.sensor_state.velocity_x
-
-        if abs(vx) < self.config.velocity_epsilon:
-            return self.config.default_r_ttc
-
+        """R_ttc: Reference time to collision (d_front / v_ref).
+        
+        Uses fixed reference speed v_ref (1.0 m/s) rather than live velocity vx
+        to keep R_ttc deconfounded from treatment C^v.
+        """
         if self.cache.forward_mask is None:
             return self.config.default_r_ttc
 
@@ -587,11 +606,9 @@ class OptimizedRiskStateNode(Node):
             return self.config.default_r_ttc
 
         d_front = float(np.min(self.sensor_state.scan_ranges[valid]))
+        v_ref = self.config.v_ref if self.config.v_ref > 0 else 1.0
 
-        if vx > 0:
-            return min(d_front / vx, self.config.default_r_ttc)
-        # Moving backward - could compute backward TTC
-        return self.config.default_r_ttc
+        return min(d_front / v_ref, self.config.default_r_ttc)
     
     def _compute_r_vis(self) -> float:
         fwd = self.cache.forward_mask
@@ -650,11 +667,11 @@ class OptimizedRiskStateNode(Node):
         return float(np.mean(local_window == 254))
     
     def _compute_r_width(self) -> float:
-        """R_width: Corridor width perpendicular to heading."""
+        """R_width: Corridor width perpendicular to heading and along lookahead corridor."""
         ranges = self.sensor_state.scan_ranges
         angles = self.sensor_state.scan_angles
 
-        if angles is None:
+        if angles is None or ranges is None:
             return self.config.default_r_width
 
         robot_yaw = self.sensor_state.robot_yaw
@@ -667,7 +684,7 @@ class OptimizedRiskStateNode(Node):
         # World-frame angles
         world_angles = angles + robot_yaw
 
-        # Left perpendicular (robot_yaw + 90°)
+        # 1. Current lateral width at robot position (perpendicular left/right)
         left_angle = robot_yaw + np.pi / 2
         left_diff = np.abs(np.mod(world_angles - left_angle + np.pi, 2 * np.pi) - np.pi)
         left_mask = left_diff < self.config.lateral_tolerance
@@ -676,7 +693,6 @@ class OptimizedRiskStateNode(Node):
                   if len(left_ranges) > 0 and np.any(np.isfinite(left_ranges))
                   else np.inf)
 
-        # Right perpendicular (robot_yaw - 90°)
         right_angle = robot_yaw - np.pi / 2
         right_diff = np.abs(np.mod(world_angles - right_angle + np.pi, 2 * np.pi) - np.pi)
         right_mask = right_diff < self.config.lateral_tolerance
@@ -685,14 +701,41 @@ class OptimizedRiskStateNode(Node):
                    if len(right_ranges) > 0 and np.any(np.isfinite(right_ranges))
                    else np.inf)
 
-        # Corridor width is sum of left and right clearance
         if np.isinf(d_left) and np.isinf(d_right):
-            return self.config.default_r_width
-        if np.isinf(d_left):
-            return float(2 * d_right)
-        if np.isinf(d_right):
-            return float(2 * d_left)
-        return float(d_left + d_right)
+            w_curr = self.config.default_r_width
+        elif np.isinf(d_left):
+            w_curr = float(2 * d_right)
+        elif np.isinf(d_right):
+            w_curr = float(2 * d_left)
+        else:
+            w_curr = float(d_left + d_right)
+
+        # 2. Anticipatory lookahead corridor width ahead (0.2m <= x_rel <= look_ahead_distance)
+        x_rel = valid_ranges * np.cos(angles)
+        y_rel = valid_ranges * np.sin(angles)
+        look_ahead = getattr(self.config, "look_ahead_distance", 3.0)
+
+        fwd_mask = (x_rel >= 0.2) & (x_rel <= look_ahead) & np.isfinite(valid_ranges)
+        if np.any(fwd_mask):
+            y_fwd = y_rel[fwd_mask]
+            left_fwd = y_fwd[y_fwd >= 0.15]
+            right_fwd = np.abs(y_fwd[y_fwd <= -0.15])
+
+            d_left_fwd = np.min(left_fwd) if len(left_fwd) > 0 else np.inf
+            d_right_fwd = np.min(right_fwd) if len(right_fwd) > 0 else np.inf
+
+            if np.isinf(d_left_fwd) and np.isinf(d_right_fwd):
+                w_ahead = self.config.default_r_width
+            elif np.isinf(d_left_fwd):
+                w_ahead = float(2 * d_right_fwd)
+            elif np.isinf(d_right_fwd):
+                w_ahead = float(2 * d_left_fwd)
+            else:
+                w_ahead = float(d_left_fwd + d_right_fwd)
+        else:
+            w_ahead = self.config.default_r_width
+
+        return float(min(w_curr, w_ahead))
         
     
     def _compute_r_clear(self) -> float:
@@ -864,13 +907,26 @@ class OptimizedRiskStateNode(Node):
     # PUBLISHING
     # =========================================================================
     
+    def _joint_state_cb(self, msg: JointState) -> None:
+        """Callback for joint states to compute normalized arm extension index a_t in [0, 1]."""
+        if not msg.name or not msg.position:
+            return
+        try:
+            name_to_pos = dict(zip(msg.name, msg.position))
+            if "arm_4_joint" in name_to_pos:
+                val_4 = name_to_pos["arm_4_joint"]
+                a_t = (1.94 - val_4) / (1.94 - 1.2)
+                self.sensor_state.arm_extension_index = float(np.clip(a_t, 0.0, 1.0))
+        except Exception:
+            pass
+
     def _publish_risk_state(self, risk_state: np.ndarray) -> None:
         """Publish risk state as Float64MultiArray."""
         msg = Float64MultiArray()
         
-        # Setup layout for clarity
+        # Setup layout for clarity (9D vector including a_t)
         msg.layout = MultiArrayLayout()
-        msg.layout.dim = [MultiArrayDimension(label='risk_state', size=8, stride=8)]
+        msg.layout.dim = [MultiArrayDimension(label='risk_state', size=9, stride=9)]
         msg.layout.data_offset = 0
         
         msg.data = risk_state.tolist()

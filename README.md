@@ -1,39 +1,50 @@
 # rct_data_collector
-This repository is a ros2 package for collecting randomized controlled trials in gazebo.
+A ROS 2 package for collecting randomized controlled trial (RCT) dataset probes and full navigation trials in Gazebo.
 
-## Usage
+---
+
+## Usage & Commands
 
 ### Run a Single Test Trial
-To run a single test trial, run the following command:
+To run a test trial, run:
 
 ```bash
-ros2 run rct_collector rct_collect   --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml   --trials 20   --output /home/forough/phd_projects/online_tuner/rct_data_smoke   --presampled-poses /home/forough/phd_projects/online_tuner/src/rct_data_collector/rct_data/presampled_poses.json   --move-arm --collect-risk   --timeout 150 --log-level DEBUG --seed 42
-
+ros2 run rct_collector rct_collect \
+  --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml \
+  --trials 20 \
+  --output ./rct_data_smoke \
+  --presampled-poses ./rct_data/presampled_poses.json \
+  --move-arm --collect-risk \
+  --timeout 150 --log-level DEBUG --seed 42
 ```
 
-### Interactive Motion Visualizer
-To visualize the recorded trial trajectory, motion, heading, and footprint over time on the map:
+---
+
+## Campaigns: A vs B
+
+The collector runs two coexisting experiment shapes, selected with `--campaign {A,B}` (default `B`). Every row in the CSV/JSON carries a `campaign` column so downstream analysis never accidentally merges them.
+
+- **Campaign B** (default): a full point-to-point mission per trial, one random Nav2/arm config sampled up front and held for the whole mission. Feeds an efficiency model `E[S | do(C), R]`.
+- **Campaign A**: short "decision-point" collision probes. Each probe drives the robot a short distance under a **fixed baseline config**, freezes a snapshot of the risk-state `R`, then swaps to a **random config `c`** mid-drive and watches a short horizon for a Gazebo collision `Y^H`. Each probe writes exactly one `(c, R, Y^H)` row, feeding a collision model `P(Y^H | do(C), R)`.
+
+### Run Campaign A Probes
 
 ```bash
-# Direct module execution:
-python3 -m rct_collector.scripts.visualizer --json /path/to/trial.json
-
-# Or after building with colcon / installing:
-ros2 run rct_collector rct_visualize --json /path/to/trial.json
+ros2 run rct_collector rct_collect \
+  --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml \
+  --campaign A --n-probes 500 \
+  --horizon-sec 3.0 --baseline-settle-sec 2.0 --washout-sec 2.0 \
+  --output ./rct_data_campaign_a --collect-risk --seed 42 --move-arm --presampled-poses ./rct_data/presampled_poses.json
 ```
-This opens a web-based dashboard with:
-1. Time slider to step/play the robot motion over time.
-2. File path input and browser to load any recorded `.json` trial.
-3. Map rendering with start/goal poses, global planner path, executed path, and footprint polygon overlays.
 
-## Required Gazebo plugins for custom worlds
+---
+
+## Required Gazebo Plugins for Custom Worlds
 
 If you use your own world file, add **both** plugins as direct children of `<world>` (not inside any `<model>`). Without them, the robot won't reposition between trials and collisions won't be recorded.
 
 ```xml
 <world name="your_world">
-
-  <!-- ... your world contents ... -->
 
   <!-- 1. Pose control: teleport robot to trial start pose (/gazebo/set_entity_state) -->
   <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
@@ -57,46 +68,26 @@ If you use your own world file, add **both** plugins as direct children of `<wor
 </world>
 ```
 
-## generate presampled poses randomly
-python3 main.py   --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml   --generate-poses 100   --carry-footprint '[[-0.275, 0.000], [-0.238, -0.138], [0.070, -0.476], [0.230, -0.641], [0.420, -0.698], [0.480, -0.698], [0.510, -0.646], [0.238, 0.138], [0.138, 0.238], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]'   --output /home/forough/phd_projects/online_tuner/src/rct_data_collector/rct_data   --min-distance 10.0 --max-distance 20.0   --seed 42 
+---
 
+## Generate Presampled Poses Randomly
 
+```bash
+python3 rct_collector/scripts/main.py \
+  --map /opt/ros/humble/share/pal_maps/maps/pal_office/map.yaml \
+  --generate-poses 15000 \
+  --clearance 0.35 \
+  --campaign A \
+  --output ./rct_data_campaign_a_pal_office
+```
 
-### Setup
+---
 
-1. Build and source the collision-monitor package (Gazebo must be launched from this sourced shell, or the `.so` won't be found):
+## Setup & Build
+
+1. Build and source the collision-monitor and collector packages from your workspace root:
    ```bash
-   colcon build --packages-select gazebo_collision_monitor
+   cd <your_workspace_root>
+   colcon build --packages-select gazebo_collision_monitor rct_collector
    source install/setup.bash
    ```
-
-2. Set `<robot_name>` to your robot's exact model name:
-   ```bash
-   ros2 service call /gazebo/get_model_list gazebo_msgs/srv/GetModelList '{}'
-   ```
-
-3. Add any non-collision static models (floor, map mesh) to `<ignore_models>`, space-separated. Only `ground_plane` is ignored by default.
-
-4. Verify both are live after launch:
-   ```bash
-   ros2 service list | grep set_entity_state     # plugin 1
-   ros2 topic echo /gazebo/collision --once       # plugin 2
-   ```
-
-  ###Remember
-  - xhost +local:root in your own system before runing the docker container to give acess to the GUI.
-
-
-| `failure_reason` | Detected by | Answers |
-|---|---|---|
-| `PLANNING_FAILED_INITIAL` | pre-nav `getPath()` returned no path | goal unreachable from start |
-| `BT_PLANNER_FAILED` | `ComputePathToPose` → FAILURE on `/behavior_tree_log` | planner failed mid-run |
-| `BT_CONTROLLER_FAILED` | `FollowPath` → FAILURE on `/behavior_tree_log` | MPPI gave up |
-| `BT_OTHER_FAILED` | any other BT node → FAILURE | container/unknown node |
-| `STUCK_NO_PROGRESS` | stall detector in the recording loop | robot stopped moving |
-| `RUNNER_TIMEOUT` | `timeout_sec` in the recording loop | ran out of clock |
-| `COLLISION` | `/gazebo/collision` contact | physical hit |
-| `RUNNER_EXCEPTION` | orchestrator `_record_failure` | harness crashed |
-| `NONE` | no failure detected | trial ran to completion |
-| `UNKNOWN` | Nav2 said FAILED, BT log was silent | diagnostic gap |
-  

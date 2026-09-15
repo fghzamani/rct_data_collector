@@ -184,11 +184,11 @@ class FootprintCollisionChecker:
         # Compute area
         area = self._computePolygonArea(vertices)
         
-        # Compute circumscribed radius (max distance from centroid to vertex)
-        circumscribed = self._computeCircumscribedRadius(vertices, centroid)
+        # Compute circumscribed radius (max distance from base_link origin (0,0) to vertex)
+        circumscribed = self._computeCircumscribedRadius(vertices, (0.0, 0.0))
         
-        # Compute inscribed radius (min distance from centroid to edge)
-        inscribed = self._computeInscribedRadius(vertices, centroid)
+        # Compute inscribed radius (min distance from base_link origin (0,0) to edge)
+        inscribed = self._computeInscribedRadius(vertices, (0.0, 0.0))
         
         return FootprintGeometry(
             inscribed_radius=inscribed,
@@ -221,16 +221,16 @@ class FootprintCollisionChecker:
         return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
     
     def _computeCircumscribedRadius(self, vertices: np.ndarray, 
-                                     centroid: Tuple[float, float]) -> float:
-        """Compute circumscribed radius (max distance from centroid to vertex)."""
-        cx, cy = centroid
+                                     center: Tuple[float, float] = (0.0, 0.0)) -> float:
+        """Compute circumscribed radius (max distance from reference center, default base_link origin, to vertex)."""
+        cx, cy = center
         distances = np.sqrt((vertices[:, 0] - cx)**2 + (vertices[:, 1] - cy)**2)
         return float(np.max(distances))
     
     def _computeInscribedRadius(self, vertices: np.ndarray,
-                                 centroid: Tuple[float, float]) -> float:
-        """Compute inscribed radius (min distance from centroid to any edge)."""
-        cx, cy = centroid
+                                 center: Tuple[float, float] = (0.0, 0.0)) -> float:
+        """Compute inscribed radius (min distance from reference center, default base_link origin, to any edge)."""
+        cx, cy = center
         n = len(vertices)
         min_distance = float('inf')
         
