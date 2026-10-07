@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """measure_footprint.py — capture a matching (joints, footprint) pair for one arm pose.
 
-Hold TIAGo's arm in the pose you want (tuck it, or extend it to the side), then
-run this. It reads the *current* arm joint angles from /joint_states AND the live
-TF of every arm/wrist/gripper link, projects those links onto the ground plane in
+Hold Mirte's arm in the pose you want (tuck it, or extend it to carry), then run
+this. It reads the *current* arm joint angles from /joint_states AND the live TF
+of every arm/wrist/gripper link, projects those links onto the ground plane in
 the base frame, and returns:
 
-  * the 7 arm joint targets  -> ARM_CONFIGS[label]["joints"]
+  * the 4 arm joint targets  -> ARM_CONFIGS[label]["joints"]
   * the measured footprint    -> ARM_CONFIGS[label]["footprint"]
 
 Because the polygon is derived from the SAME physical pose as the joints, the two
@@ -14,22 +14,22 @@ halves of the footprint variable can't drift apart — which is the whole point:
 do(F_t = <label>) then means one coherent physical state, and the costmap geometry
 Nav2 plans against is the geometry the robot actually has.
 
-Workflow
---------
-  # tucked baseline (arm already home):
+Workflow (Mirte)
+----------------
+  # tucked baseline (arm already stowed):
   ros2 run rct_collector measure_footprint --label tucked
 
-  # lateral pose — first drive the arm out to the side, e.g.:
-  ros2 action send_goal /arm_controller/follow_joint_trajectory \
+  # carry pose — first drive the arm out, e.g.:
+  ros2 action send_goal /mirte_master_arm_controller/follow_joint_trajectory \
       control_msgs/action/FollowJointTrajectory \
-      "{trajectory: {joint_names: [arm_1_joint,arm_2_joint,arm_3_joint,arm_4_joint,arm_5_joint,arm_6_joint,arm_7_joint], \
-        points: [{positions: [0.0,0.0,0.0,0.0,0.0,0.0,0.0], time_from_start: {sec: 4}}]}}"
-  # ...tweak the positions, watch RViz until the arm points to the side, then:
-  ros2 run rct_collector measure_footprint --label lateral
+      "{trajectory: {joint_names: [shoulder_pan_joint,shoulder_lift_joint,elbow_joint,wrist_joint], \
+        points: [{positions: [0.0,0.0,0.0,0.0], time_from_start: {sec: 4}}]}}"
+  # ...tweak the positions, watch RViz until the arm is extended, then:
+  ros2 run rct_collector measure_footprint --label carry
 
-Paste the printed block into ARM_CONFIGS in scripts/param_space.py. Since the
-costmap `presets` are generated from ARM_CONFIGS, updating that one dict updates
-both the costmap footprint AND trial_runner's collision checker together.
+Paste the printed block into ARM_CONFIGS in
+online_causal_tuner/online_causal_tuner/online_tuner_node.py (labels: tucked / carry).
+Update FOOTPRINT_GEOMETRY there with the printed inscribed/circumscribed radii too.
 """
 import argparse
 import math
@@ -44,8 +44,7 @@ import tf2_ros
 
 
 ARM_JOINT_NAMES = [
-    "arm_1_joint", "arm_2_joint", "arm_3_joint", "arm_4_joint",
-    "arm_5_joint", "arm_6_joint", "arm_7_joint",
+    "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_joint",
 ]
 
 # ── pure-geometry helpers (numpy only, no scipy/shapely) ─────────────────────
@@ -188,40 +187,48 @@ class FootprintMeasurer(Node):
         insc = inscribed_radius(hull)
         poly_str = "[" + ", ".join(f"[{x:.3f}, {y:.3f}]" for x, y in hull) + "]"
 
-        # 5. emit a ready-to-paste ARM_CONFIGS entry
+        # 5. emit a ready-to-paste ARM_CONFIGS entry (Mirte structure: footprint + joints)
         joints_str = ("[" + ", ".join(str(v) for v in joints) + "]") if joints else "None  # capture failed"
-        mode = "play_motion" if self.args.label == "tucked" else "joint_trajectory"
-        extra = '\n        "motion_name": "home",' if self.args.label == "tucked" else ""
+        fp_key = 0.0 if self.args.label == "tucked" else 1.0
+        width = 2.0 * circ
         print("\n" + "="*70)
         print(f"Measured pose '{self.args.label}'  (base frame: {base})")
         print(f"  links used ({len(got)}): {', '.join(got)}")
-        print(f"  inscribed_radius   = {insc:.3f} m")
+        print(f"  inscribed_radius     = {insc:.3f} m")
         print(f"  circumscribed_radius = {circ:.3f} m")
-        print(f"  vertices           = {len(hull)}")
+        print(f"  vertices             = {len(hull)}")
         print("="*70)
+        print("--> ARM_CONFIGS entry (online_tuner_node.py):")
         print(f'''    "{self.args.label}": {{
         "footprint": "{poly_str}",
-        "mode": "{mode}",{extra}
         "joints": {joints_str},
-        }},''')
+    }},''')
+        print("--> FOOTPRINT_GEOMETRY entry (online_tuner_node.py):")
+        print(f'    {fp_key}: {{"label": "{self.args.label}", '
+              f'"r_circ": {circ:.3f}, "width": {width:.3f}}},')
         print("="*70)
-        print("Paste into ARM_CONFIGS in scripts/param_space.py. The costmap presets\n"
-              "are generated from ARM_CONFIGS, so this updates costmap + checker together.\n")
+        print("Paste both into online_causal_tuner/online_causal_tuner/online_tuner_node.py.\n"
+              "The tuner sets this footprint on the local costmap when it selects this arm state.\n")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--label", required=True, help="pose name, e.g. tucked / lateral")
-    p.add_argument("--base-frame", default="base_footprint",
-                   help="frame the footprint is expressed in (ground-projected)")
-    p.add_argument("--base-radius", type=float, default=0.275,
-                   help="mobile-base radius (m) for the base outline octagon")
+    p.add_argument("--base-frame", default="base_link",
+                   help="frame the footprint is expressed in (ground-projected). "
+                        "base_link is always published by odometry; base_footprint "
+                        "only exists while the nav launch runs (base_link->base_footprint "
+                        "is a zero transform, so the XY footprint is identical).")
+    p.add_argument("--base-radius", type=float, default=0.22,
+                   help="mobile-base radius (m) for the base outline octagon "
+                        "(Mirte: robot_radius 0.22 from demo_params.yaml)")
     p.add_argument("--link-buffer", type=float, default=0.06,
                    help="radial buffer (m) added around each arm link centerline "
                         "to approximate link thickness")
-    p.add_argument("--link-filter", default=r"(arm_\d|wrist|gripper|hand|forearm)",
-                   help="regex; TF frames matching it are treated as arm links")
+    p.add_argument("--link-filter", default=r"(shoulder|elbow|wrist|gripper)",
+                   help="regex; TF frames matching it are treated as arm links "
+                        "(Mirte arm/gripper link names)")
     p.add_argument("--links", default="",
                    help="explicit comma-separated frame list (overrides --link-filter)")
     p.add_argument("--joint-topic", default="/joint_states")

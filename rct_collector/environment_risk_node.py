@@ -191,7 +191,12 @@ class OptimizedRiskStateNode(Node):
         # Declare and get parameters
         self._declare_parameters()
         self.config = self._load_config()
-        
+
+        # a_t arm-extension mapping (Mirte-configurable; see _declare_parameters)
+        self.arm_ext_joint = self.get_parameter('arm_extension_joint').value
+        self.arm_ext_stowed = float(self.get_parameter('arm_extension_stowed_rad').value)
+        self.arm_ext_extended = float(self.get_parameter('arm_extension_extended_rad').value)
+
         # Pre-compute constants
         self.sector_width = 2 * np.pi / self.config.num_polar_sectors
         
@@ -332,6 +337,15 @@ class OptimizedRiskStateNode(Node):
         self.declare_parameter('risk_inflation_radius_m', 0.30)
         self.declare_parameter('risk_cost_scaling_factor', 10.0)
         self.declare_parameter('v_ref', 1.0)
+
+        # a_t (arm extension index) mapping. Mirte has no arm_4_joint (that was
+        # TIAGo); we track elbow_joint, which moves most between the tuner's two
+        # ARM_CONFIGS poses (home 0.5 -> carry -1.5188, delta ~2.0 rad).
+        # a_t = 0 at *_stowed_rad, 1 at *_extended_rad, clipped to [0,1].
+        # Keep these in sync with ARM_CONFIGS in online_tuner_node.py.
+        self.declare_parameter('arm_extension_joint', 'elbow_joint')
+        self.declare_parameter('arm_extension_stowed_rad', 0.5)      # home elbow
+        self.declare_parameter('arm_extension_extended_rad', -1.5188)  # carry elbow
     
     
     def _load_config(self) -> RiskStateConfig:
@@ -913,10 +927,12 @@ class OptimizedRiskStateNode(Node):
             return
         try:
             name_to_pos = dict(zip(msg.name, msg.position))
-            if "arm_4_joint" in name_to_pos:
-                val_4 = name_to_pos["arm_4_joint"]
-                a_t = (1.94 - val_4) / (1.94 - 1.2)
-                self.sensor_state.arm_extension_index = float(np.clip(a_t, 0.0, 1.0))
+            if self.arm_ext_joint in name_to_pos:
+                val = name_to_pos[self.arm_ext_joint]
+                span = self.arm_ext_extended - self.arm_ext_stowed
+                if abs(span) > 1e-6:
+                    a_t = (val - self.arm_ext_stowed) / span
+                    self.sensor_state.arm_extension_index = float(np.clip(a_t, 0.0, 1.0))
         except Exception:
             pass
 

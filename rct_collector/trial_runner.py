@@ -1912,7 +1912,12 @@ class TrialRunner:
             map_thresh = 0.55 if is_carry else 0.30
             
             is_map_collision = (rec.min_map_value is not None and rec.min_map_value <= map_thresh)
-            is_lethal_footprint = (checker is not None and footprint_cost >= 254)
+            is_close_proximity = (
+                (rec.min_scan_value is not None and rec.min_scan_value <= map_thresh) or
+                (rec.min_map_value is not None and rec.min_map_value <= map_thresh) or
+                (rec.min_scan_value is None and rec.min_map_value is None)
+            )
+            is_lethal_footprint = (checker is not None and footprint_cost >= 254 and is_close_proximity)
             is_lidar_impact = (rec.min_scan_value is not None and rec.min_scan_value < 0.28)
             is_kinetic_wedge = (elapsed > 2.0 and self.get_current_speed() < 0.04 and rec.min_map_value is not None and rec.min_map_value < 0.45)
             

@@ -89,6 +89,7 @@ class OrchestratorConfig:
     min_goal_distance: float = 3.0
     max_goal_distance: float = 15.0
     obstacle_clearance_m: float = 0.85
+    footprint_clearance_m: float = 0.0
     sampling_bounds: Optional[dict] = None
 
     output_dir: str = "./rct_data"
@@ -138,7 +139,7 @@ class OrchestratorConfig:
 
     # --- Goal tolerance (recorded per row so success is re-derivable) ------
     xy_goal_tolerance: float = 0.35
-    yaw_goal_tolerance: float = 0.65
+    yaw_goal_tolerance: float = 0.9
     check_goal_tolerance_against_nav2: bool = True
     # End a trial as soon as GROUND TRUTH enters the goal tolerance.
     #
@@ -213,9 +214,7 @@ class OrchestratorConfig:
     goal_tolerance_m: float = 0.25    # Nav2 xy_goal_tolerance
     trigger_margin_m: float = 0.25    # slack on the guard
     t_min_baseline_m: float = 0.40
-    trigger_early_frac: float = 0.25   # fraction of the admissible band, at the
-                                       # EARLY end, from which the trigger is drawn.
-                                       # 1.0 = the old uniform-over-band behaviour.    # min distance under baseline before trigger
+    trigger_early_frac: float = 1.0    # 1.0 = uniform random trigger over the entire admissible band
     t_apply_cap_sec: float = 15.0     # give up waiting if trigger never fires
     plan_wait_sec: float = 3.0        # wait for Nav2 to publish a plan
 
@@ -226,9 +225,9 @@ class OrchestratorConfig:
     # robot then carries it through as much of the path as the horizon covers.
     # Identification is unchanged: apply time is a clock, independent of R, and
     # C is still drawn independently.
-    apply_mode: str = "distance"      # "distance" (default) or "early_time"
-    t_apply_min_sec: float = 1.5
-    t_apply_max_sec: float = 3.0
+    apply_mode: str = "time"          # "time" / "early_time" (default) or "distance"
+    t_apply_min_sec: float = 4.0
+    t_apply_max_sec: float = 8.0
     # With early apply the start pose is in clearance, so the collision
     # opportunity is DOWN the path. Watch long enough to reach it: the horizon
     # is extended to cover the remaining planned path, capped here so a very
@@ -239,23 +238,17 @@ class OrchestratorConfig:
     # ── Arm-transition footprint policy ─────────────────────────────────
     # The physical arm takes ~arm_move_time_sec to reach carry. The local
     # costmap footprint can be handled three ways during that transition:
-    #   "track_arm" (default, realistic): footprint follows the VERIFIED
-    #       physical arm. While the arm is opening the costmap stays tucked,
-    #       so MPPI drives confidently into the gap and the opening arm hits.
-    #       This is the real latency failure and the one the model must learn.
-    #   "hold_tucked": footprint stays tucked for the whole horizon. The
-    #       planner never avoids anything; maximises the observed collision
-    #       rate. Use to build up positive examples, but note the costmap no
-    #       longer indicates the arm state — group on arm_verified_* instead.
-    #   "instant" (old behaviour): footprint jumps to carry at apply. The
-    #       2D planner treats the robot as big before the arm is, and steers
-    #       away from doorways, suppressing the collision.
-    footprint_policy: str = "track_arm"
+    #   "instant": footprint jumps to carry immediately at treatment apply.
+    #   "track_arm": footprint follows the physical arm as it unfolds.
+    #   "hold_tucked": footprint stays tucked for the whole horizon.
+    footprint_policy: str = "instant"
     # Arm openness (0=tucked .. 1=carry target) above which "track_arm" flips
     # the local costmap to the carry polygon.
     arm_openness_carry_threshold: float = 0.60
     # Poll period for the interleaved arm/footprint/collision watch.
     transition_poll_sec: float = 0.05
+    # Start counting horizon_sec AFTER the arm reaches the carry pose (100% open).
+    start_horizon_after_arm_move: bool = True
 
     cmd_vel_topic: str = "/mobile_base_controller/cmd_vel"  # only used by --baseline-nudge
     # See TrialRunner._publish_nudge(): under the active-drive probe design the
@@ -477,8 +470,9 @@ class RCTOrchestrator:
         # still varies the sampled context) but is confined to the early
         # part of the admissible band. Identification is unaffected: this
         # changes WHICH contexts are sampled, not P(C|R), which stays uniform.
-        early_frac = float(getattr(self.config, "trigger_early_frac", 0.25))
-        u = float(self.pose_sampler.rng.uniform(max(0.0, 2.0 - early_frac), 2.0))
+        early_frac = float(getattr(self.config, "trigger_early_frac", 1.0))
+        u_min = max(0.0, 1.0 - early_frac)
+        u = float(self.pose_sampler.rng.uniform(u_min, 1.0))
         return s_lo + u * (s_hi - s_lo)
 
     def _verify_goal_tolerance(self):
@@ -489,6 +483,9 @@ class RCTOrchestrator:
         Nav2 disagree about what SUCCESS means and the outcome variable becomes
         a mixture of two definitions.
         """
+        if not getattr(self.config, "check_goal_tolerance_against_nav2", True):
+            logger.info("  Skipping goal tolerance check against Nav2 (check_goal_tolerance_against_nav2=False)")
+            return
         if self.param_applier is None:
             return
         for name, ours in (("xy_goal_tolerance", self.config.xy_goal_tolerance),
@@ -820,7 +817,7 @@ class RCTOrchestrator:
             # full remaining-distance guard is not required; any plan long
             # enough to drive t_apply_max under baseline is admissible. Only
             # the distance mode needs the guard runway after apply.
-            if getattr(self.config, "apply_mode", "distance") == "early_time":
+            if getattr(self.config, "apply_mode", "distance") in ("early_time", "time"):
                 min_plan = self.config.v_max_mps * self.config.t_apply_max_sec
                 s_apply = float("inf")   # unused in early mode
                 if d_total < min_plan:
@@ -902,7 +899,7 @@ class RCTOrchestrator:
             # wall-clock delay near the start pose; in "distance" mode the
             # trigger fires when remaining planned path crosses s_apply.
             early_time = (getattr(self.config, "apply_mode", "distance")
-                          == "early_time")
+                          in ("early_time", "time"))
             t_apply_target = None
             if early_time:
                 t_apply_target = float(self.pose_sampler.rng.uniform(
@@ -1375,8 +1372,12 @@ class RCTOrchestrator:
         rec = self.trial_runner._recorder
         last_poll = t0
         rec.record_sample(0.0)
-        while rec_now() - t0 < horizon_sec:
+        start_after_arm = getattr(self.config, "start_horizon_after_arm_move", True)
+        arm_move_timeout = float(getattr(self.config, "arm_move_time_sec", 4.0)) + 2.0
+
+        while True:
             now = rec_now()
+            elapsed_total = now - t0
             if now - last_poll >= poll:
                 last_poll = now
                 rec.record_sample(0.0)
@@ -1394,6 +1395,18 @@ class RCTOrchestrator:
                     "arm_openness": (op if op is not None else float("nan")),
                     "footprint": footprint_now,
                 })
+
+            # Check if horizon has finished
+            if start_after_arm and is_carry:
+                if t_arm_carry is not None:
+                    if now - t_arm_carry >= horizon_sec:
+                        break
+                elif elapsed_total >= arm_move_timeout + horizon_sec:
+                    break
+            else:
+                if elapsed_total >= horizon_sec:
+                    break
+
             if rec.is_collided:
                 y_h = 1
                 collision_t = rec_now() - t0

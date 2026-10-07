@@ -135,6 +135,26 @@ def parse_args():
                         "probe design the robot is already moving via MPPI during "
                         "baseline-settle-sec, so R should be non-degenerate without "
                         "it; this is a documented escape hatch, not the primary mechanism.")
+    p.add_argument("--xy-goal-tolerance", type=float, default=0.25,
+                   help="Runner XY goal tolerance (default 0.25)")
+    p.add_argument("--yaw-goal-tolerance", type=float, default=0.9,
+                   help="Runner Yaw goal tolerance (default 0.9, matching Nav2's general_goal_checker)")
+    p.add_argument("--no-check-goal-tolerance", dest="check_goal_tolerance",
+                   action="store_false", default=True,
+                   help="Skip checking goal tolerance against Nav2 live parameters")
+    p.add_argument("--footprint-policy", choices=["instant", "track_arm", "hold_tucked"], default="instant",
+                   help="Costmap footprint update policy: instant (default), track_arm, or hold_tucked")
+    p.add_argument("--trigger-early-frac", type=float, default=1.0,
+                   help="Fraction of admissible band for trigger: 1.0 = uniform random over entire drive (default 1.0)")
+    p.add_argument("--apply-mode", choices=["time", "distance", "early_time"], default="time",
+                   help="Treatment trigger mode: time (default, random wall clock delay) or distance")
+    p.add_argument("--t-apply-min", type=float, default=4.0,
+                   help="Minimum seconds after drive start before applying treatment (default 4.0)")
+    p.add_argument("--t-apply-max", type=float, default=8.0,
+                   help="Maximum seconds after drive start before applying treatment (default 8.0)")
+    p.add_argument("--no-start-horizon-after-arm-move", dest="start_horizon_after_arm_move",
+                   action="store_false", default=True,
+                   help="Do not delay horizon_sec countdown until arm reaches carry pose")
     return p.parse_args()
 
 
@@ -341,6 +361,15 @@ def main():
             arm_move_time_sec=args.arm_move_time,
             arm_move_on_change_only=not args.arm_move_every_trial,
             reset_gazebo_between_trials=not args.no_gazebo_reset,
+            xy_goal_tolerance=args.xy_goal_tolerance,
+            yaw_goal_tolerance=args.yaw_goal_tolerance,
+            check_goal_tolerance_against_nav2=args.check_goal_tolerance,
+            footprint_policy=args.footprint_policy,
+            trigger_early_frac=args.trigger_early_frac,
+            apply_mode=args.apply_mode,
+            t_apply_min_sec=args.t_apply_min,
+            t_apply_max_sec=args.t_apply_max,
+            start_horizon_after_arm_move=args.start_horizon_after_arm_move,
         )
 
     if not config.map_yaml_path and not args.resume:
