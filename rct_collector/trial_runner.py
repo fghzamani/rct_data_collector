@@ -39,7 +39,7 @@ Subscribes (recorder node):
 Footrpint polygons are:  "tucked": {
         "footprint": "[[-0.275, 0.000], [-0.238, -0.138], [-0.138, -0.238], [-0.000, -0.275], [0.138, -0.238], [0.209, -0.181], [0.238, -0.138], [0.275, 0.000], [0.252, 0.182], [0.217, 0.242], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]",
 "carry": {
-        "footprint": "[[-0.275, 0.000], [-0.238, -0.138], [0.070, -0.476], [0.230, -0.641], [0.420, -0.698], [0.480, -0.698], [0.510, -0.646], [0.238, 0.138], [0.138, 0.238], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]"
+        "footprint": (see scripts/param_space.ARM_CONFIGS: the swept arm envelope since 2026-11-13)
 """
 
 import json
@@ -363,7 +363,6 @@ class TrialResult:
     yaw_goal_tolerance_used: float = float("nan")
 
     # ── Decision-point collision probes ─────────────────────────────────────
-    world_name: str = "smoke_office"
     baseline_config: dict = field(default_factory=dict)   # captured Nav2 launch defaults
     risk_state_snapshot: Optional[dict] = None             # frozen PRE-treatment R
     y_h: Optional[int] = None                # 1 iff a Gazebo contact occurred within horizon_sec of do(C=c)
@@ -586,6 +585,87 @@ class TrialResult:
 
 # ── Recorder node ─────────────────────────────────────────────────────────────
 
+class ArmGoal:
+    """Popen-like handle for an in-flight arm action goal (in-process client).
+
+    poll() -> None while running, 0 when a result arrived, 1 if the goal was
+    rejected; wait(timeout); kill() cancels. Replaces `ros2 action send_goal`
+    subprocesses, whose 2-3 s CLI start-up put variable latency into the arm
+    timing and which failed silently (2026-11-12 smoke test, probe 4: a carry
+    goal that never moved the arm).
+    """
+
+    def __init__(self, send_future, label: str, clock):
+        self.label = label
+        self._send = send_future
+        self._clock = clock
+        self._gh = None
+        self._res = None
+        self.rejected = False
+        self.t_sent = clock()
+        self.t_accepted = None
+
+    def _update(self):
+        if self._gh is None and not self.rejected and self._send.done():
+            gh = self._send.result()
+            if gh is None or not gh.accepted:
+                self.rejected = True
+            else:
+                self._gh = gh
+                self.t_accepted = self._clock()
+                self._res = gh.get_result_async()
+
+    def poll(self):
+        self._update()
+        if self.rejected:
+            return 1
+        if self._res is not None and self._res.done():
+            return 0
+        return None
+
+    def wait(self, timeout: float):
+        t_end = time.time() + timeout
+        while self.poll() is None and time.time() < t_end:
+            time.sleep(0.02)
+        return self.poll()
+
+    def kill(self):
+        self._update()
+        if self._gh is not None and not (self._res is not None and self._res.done()):
+            try:
+                self._gh.cancel_goal_async()
+            except Exception:   # noqa: BLE001
+                pass
+
+    @property
+    def succeeded(self) -> bool:
+        if self.poll() != 0:
+            return False
+        r = self._res.result()
+        if r is None or r.status != 4:          # GoalStatus.STATUS_SUCCEEDED
+            return False
+        res = r.result
+        if hasattr(res, "error_code"):
+            return res.error_code == 0
+        if hasattr(res, "success"):
+            return bool(res.success)
+        return True
+
+    def status(self) -> str:
+        p = self.poll()
+        if p is None:
+            return "accepted_running" if self._gh is not None else "pending"
+        if p == 1:
+            return "rejected"
+        return "succeeded" if self.succeeded else "failed"
+
+
+class SimStalledError(RuntimeError):
+    """The Gazebo sim clock stopped advancing (paused, crashed, starved).
+    The probe in flight is unusable; the run must stop so it can be restarted
+    and the probe re-run, never recorded as an ordinary row."""
+
+
 class TrialRunnerNode(Node):
     """Subscriber-only ROS node that records robot state + risk during a trial.
 
@@ -598,8 +678,16 @@ class TrialRunnerNode(Node):
                  self_filter_radius_m: float = 0.30,
                  angle_mask_deg: Optional[list] = None,
                  gazebo_robot_model: str = "tiago"):
-        super().__init__("rct_trial_runner")
+        # Simulation time. Without use_sim_time every horizon, settle and
+        # trigger window was measured on the WALL clock, so a slower Gazebo
+        # (real-time factor < 1) silently shrank each window in sim-seconds.
+        from rclpy.parameter import Parameter as _P
+        super().__init__("rct_trial_runner",
+                         parameter_overrides=[_P("use_sim_time", _P.Type.BOOL, True)])
         self.gazebo_robot_model = gazebo_robot_model
+        # (sim_sec, wall_sec) of the last time the sim clock was seen to move;
+        # see sim_clock_alive().
+        self._clock_seen = (0.0, time.time())
         self.collect_risk_features = collect_risk_features
 
         # LiDAR self-return rejection (see _scan_callback).
@@ -881,7 +969,8 @@ class TrialRunnerNode(Node):
         try:
             for name, pos in zip(msg.name, msg.position):
                 self.joint_positions[name] = float(pos)
-            self.joint_states_stamp = time.time()
+            # sim-time stamp: get_joint_positions() compares it with now_sec()
+            self.joint_states_stamp = self.now_sec()
         except (TypeError, ValueError):
             pass
 
@@ -920,7 +1009,8 @@ class TrialRunnerNode(Node):
 
     def _collision_info_callback(self, msg):
         self.get_logger().warn(f"Collision info received: {msg.data}")
-        self.collision_links.append({"t": time.time(), "info": msg.data})
+        self.collision_links.append({"t": time.time(), "t_sim": self.now_sec(),
+                                     "info": msg.data})
         self.is_collided = True
 
     # ── recording ──
@@ -931,6 +1021,7 @@ class TrialRunnerNode(Node):
         gx, gy, gyaw = self.pose()
         entry = {
             "timestamp": time.time(),
+            "t_sim": self.now_sec(),
             # Ground truth. Every downstream outcome uses this key.
             "pose": [gx, gy, gyaw],
             # What the robot thought at the same instant. The difference is
@@ -983,18 +1074,26 @@ class TrialRunnerNode(Node):
         return {n: self.joint_positions[n] for n in names if n in self.joint_positions}
 
     def now_sec(self) -> float:
-        """ROS / simulation clock time in seconds.
-        
-        Using ROS clock ensures time metrics (horizon, timeouts, travel time)
-        are tied to Gazebo simulation clock rather than host wall-clock time.
+        """Simulation clock time in seconds (use_sim_time=True on this node).
+
+        Returns 0.0 until the first /clock message arrives; TrialRunner waits
+        for that at startup. It used to fall back to time.time(), which mixed
+        wall and sim time in the same difference whenever /clock hiccuped.
         """
         try:
-            nanos = self.get_clock().now().nanoseconds
-            if nanos > 0:
-                return nanos / 1e9
+            return self.get_clock().now().nanoseconds / 1e9
         except Exception:
-            pass
-        return time.time()
+            return 0.0
+
+    def sim_clock_alive(self, stall_wall_sec: float = 5.0) -> bool:
+        """False once the sim clock has not advanced for `stall_wall_sec` of
+        wall time: Gazebo paused, crashed, or so slow that a probe window can
+        never finish. Callers turn this into a hard SIM_STALLED abort."""
+        sim, wall = self.now_sec(), time.time()
+        if sim > self._clock_seen[0]:
+            self._clock_seen = (sim, wall)
+            return True
+        return (wall - self._clock_seen[1]) < stall_wall_sec
 
 
 # ── Trial runner ──────────────────────────────────────────────────────────────
@@ -1065,6 +1164,8 @@ class TrialRunner:
         # defaults to 1 Hz, which quantises every pose-derived outcome. 0.0
         # disables the check.
         gt_min_rate_hz: float = 20.0,
+        strict_startup_checks: bool = True,
+        nav2_active_timeout_sec: float = 240.0,
         # Stall detection. If the ground-truth pose does not move by at least
         # no_progress_dist_m / no_progress_yaw_rad within this many seconds, end
         # the trial as STUCK instead of waiting out timeout_sec. Set to 0.0 to
@@ -1103,6 +1204,7 @@ class TrialRunner:
         self.scan_self_filter_radius_m = scan_self_filter_radius_m
         self.scan_angle_mask_deg = scan_angle_mask_deg
         self.gt_min_rate_hz = gt_min_rate_hz
+        self.strict_startup_checks = strict_startup_checks
         self.no_progress_timeout_sec = no_progress_timeout_sec
         self.no_progress_dist_m = no_progress_dist_m
         self.no_progress_yaw_rad = no_progress_yaw_rad
@@ -1132,20 +1234,18 @@ class TrialRunner:
         self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
         self._spin_thread.start()
 
+        # Every window is timed on the sim clock; refuse to start without it.
+        t_wait = time.time()
+        while self._recorder.now_sec() <= 0.0:
+            if time.time() - t_wait > 30.0:
+                raise RuntimeError("No /clock after 30 s: Gazebo is not running or "
+                                   "not publishing sim time. Refusing to time probes "
+                                   "on the wall clock.")
+            time.sleep(0.1)
+        logger.info(f"Sim clock ✓ (t={self._recorder.now_sec():.1f} s)")
+
         self._navigator = BasicNavigator()
-        logger.info("Waiting for Nav2 to become active...")
-        try:
-            self._navigator._waitForNodeToActivate('bt_navigator')
-        except Exception as e:
-            logger.warning(f"Nav2 active check fallback: {e}")
-        logger.info("Nav2 active ✓")
 
-        self._costmap_cli = self._navigator.create_client(
-            GetCostmap, "/global_costmap/get_costmap")
-
-        if self.save_per_trial_json:
-            os.makedirs(os.path.join(self.output_dir, "trials"), exist_ok=True)
-            
         from geometry_msgs.msg import PoseWithCovarianceStamped
         from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoSHistoryPolicy
 
@@ -1161,14 +1261,31 @@ class TrialRunner:
         self._initpose_pub = self._navigator.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", qos)
 
+        self._wait_for_nav2_active(nav2_active_timeout_sec)
+
+        self._costmap_cli = self._navigator.create_client(
+            GetCostmap, "/global_costmap/get_costmap")
+
+        if self.save_per_trial_json:
+            os.makedirs(os.path.join(self.output_dir, "trials"), exist_ok=True)
+            
+        # Both are hard requirements for probe data. The probe path has no
+        # LiDAR/footprint collision fallback, and a pose silently taken from
+        # AMCL instead of ground truth corrupts every outcome. These used to be
+        # downgraded to warnings; set strict_startup_checks=False only for
+        # debugging in a world without the plugins.
         try:
             self._assert_collision_channel(timeout_sec=2.0)
         except RuntimeError as err:
-            logger.warning(f"Notice: {err} Falling back to LiDAR + Footprint Collision Checker.")
+            if self.strict_startup_checks:
+                raise
+            logger.warning(f"NOT STRICT: {err}")
         try:
             self._wait_for_ground_truth(min_rate_hz=self.gt_min_rate_hz)
         except RuntimeError as err:
-            logger.warning(f"Notice: {err} Falling back to /ground_truth_odom or /amcl_pose for pose tracking.")
+            if self.strict_startup_checks:
+                raise
+            logger.warning(f"NOT STRICT: {err}")
 
     def _assert_collision_channel(self, timeout_sec: float = 10.0):
         """Refuse to start if nothing publishes /gazebo/collision.
@@ -1327,6 +1444,29 @@ class TrialRunner:
         truth is unavailable. See TrialRunnerNode.localization_error()."""
         return self._recorder.localization_error()
 
+    def get_collision_contacts(self, limit: int = 50) -> list:
+        """Contact reports (/gazebo/collision_info) buffered since the last
+        reset, so the probe JSON can say WHAT was hit, not only that it was."""
+        return list(self._recorder.collision_links[:limit])
+
+    def is_collided(self) -> bool:
+        return bool(self._recorder.is_collided)
+
+    def sim_clock_alive(self, stall_wall_sec: float = 5.0) -> bool:
+        return self._recorder.sim_clock_alive(stall_wall_sec)
+
+    def publish_initial_pose(self, pose: dict) -> None:
+        self._publish_initial_pose(pose)
+
+    def action_client(self, action_type, name: str):
+        """One cached rclpy ActionClient per action name, on the recorder node
+        (whose executor thread resolves the goal/result futures)."""
+        from rclpy.action import ActionClient
+        cache = self.__dict__.setdefault("_action_clients", {})
+        if name not in cache:
+            cache[name] = ActionClient(self._recorder, action_type, name)
+        return cache[name]
+
     def reset_probe_collision_state(self) -> None:
         """Clear buffered collision/risk state (TrialRunnerNode.reset()).
 
@@ -1356,6 +1496,8 @@ class TrialRunner:
         rec.record_sample(0.0)
         while rec.now_sec() - t0 < horizon_sec:
             now = rec.now_sec()
+            if not rec.sim_clock_alive():
+                raise SimStalledError(f"sim clock frozen at t={now:.2f} s")
             if now - last_record >= record_period:
                 rec.record_sample(0.0)
                 last_record = now
@@ -1378,6 +1520,8 @@ class TrialRunner:
         collision_t = None
         while rec.now_sec() - t0 < horizon_sec:
             now = rec.now_sec()
+            if not rec.sim_clock_alive():
+                raise SimStalledError(f"sim clock frozen at t={now:.2f} s")
             if now - last_record >= record_period:
                 rec.record_sample(0.0)
                 last_record = now
@@ -1727,7 +1871,18 @@ class TrialRunner:
     def shutdown(self):
         try:
             self._executor.shutdown()
+            if getattr(self, "_spin_thread", None) is not None:
+                self._spin_thread.join(timeout=5.0)
+            for cli in (self.__dict__.get("_action_clients") or {}).values():
+                try:
+                    cli.destroy()
+                except Exception:   # noqa: BLE001
+                    pass
             self._recorder.destroy_node()
+            try:
+                self._navigator.destroy_node()
+            except Exception:   # noqa: BLE001
+                pass
         finally:
             if rclpy.ok():
                 rclpy.shutdown()
@@ -1912,7 +2067,12 @@ class TrialRunner:
             map_thresh = 0.55 if is_carry else 0.30
             
             is_map_collision = (rec.min_map_value is not None and rec.min_map_value <= map_thresh)
-            is_lethal_footprint = (checker is not None and footprint_cost >= 254)
+            is_close_proximity = (
+                (rec.min_scan_value is not None and rec.min_scan_value <= map_thresh) or
+                (rec.min_map_value is not None and rec.min_map_value <= map_thresh) or
+                (rec.min_scan_value is None and rec.min_map_value is None)
+            )
+            is_lethal_footprint = (checker is not None and footprint_cost >= 254 and is_close_proximity)
             is_lidar_impact = (rec.min_scan_value is not None and rec.min_scan_value < 0.28)
             is_kinetic_wedge = (elapsed > 2.0 and self.get_current_speed() < 0.04 and rec.min_map_value is not None and rec.min_map_value < 0.45)
             
@@ -2007,6 +2167,45 @@ class TrialRunner:
         return ps
 
 
+    def _wait_for_nav2_active(self, timeout_sec: float) -> None:
+        """Seed AMCL at the ground-truth pose, then wait for bt_navigator.
+
+        Headless there is nobody to click "2D Pose Estimate": AMCL never
+        publishes map->odom, the global costmap waits for that transform
+        forever, planner_server never activates and neither does bt_navigator.
+        The old _waitForNodeToActivate() then blocked with no timeout (found in
+        the 2026-11-12 headless smoke test). The initial pose is re-sent every
+        10 s while waiting, in case AMCL was not yet subscribed.
+        """
+        from lifecycle_msgs.srv import GetState
+        t_gt = time.time()
+        while not self._recorder.gt_valid and time.time() - t_gt < 15.0:
+            time.sleep(0.1)
+        cli = self._navigator.create_client(GetState, "/bt_navigator/get_state")
+        deadline = time.time() + timeout_sec
+        last_seed = 0.0
+        logger.info("Waiting for Nav2 to become active (AMCL seeded from ground truth)...")
+        while time.time() < deadline:
+            if time.time() - last_seed > 10.0:
+                if self._recorder.gt_valid:
+                    x, y, yaw = self._recorder.pose()
+                    self._publish_initial_pose({"x": x, "y": y, "yaw": yaw}, timeout_sec=2.0)
+                    logger.info(f"  /initialpose at ground truth ({x:.2f}, {y:.2f}, {yaw:.2f})")
+                else:
+                    logger.warning("  no ground-truth pose yet; cannot seed AMCL")
+                last_seed = time.time()
+            if cli.wait_for_service(timeout_sec=1.0):
+                fut = cli.call_async(GetState.Request())
+                rclpy.spin_until_future_complete(self._navigator, fut, timeout_sec=2.0)
+                res = fut.result()
+                if res is not None and res.current_state.label == "active":
+                    logger.info("Nav2 active ✓")
+                    return
+            time.sleep(1.0)
+        raise RuntimeError(
+            f"bt_navigator not active after {timeout_sec:.0f} s. Check that AMCL "
+            f"received /initialpose and that map->odom is being published.")
+
     def _publish_initial_pose(self, pose: dict, cov=None, timeout_sec=5.0):
         node = self._navigator
         msg = PoseWithCovarianceStamped()
@@ -2032,9 +2231,10 @@ class TrialRunner:
         if self._initpose_pub.get_subscription_count() == 0:
             logger.warning("  /initialpose has no subscriber (AMCL not up?); publishing anyway.")
 
-        # Stamp at publish time; send a few times.
+        # Stamp with SIM time (AMCL runs on /clock); the navigator node's
+        # clock is wall time. Send a few times.
         for _ in range(3):
-            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.header.stamp = self._recorder.get_clock().now().to_msg()
             self._initpose_pub.publish(msg)
             time.sleep(0.05)
 
@@ -2203,58 +2403,54 @@ class TrialRunner:
                         tol_xy: float = 0.10) -> bool:
         """Teleport in Gazebo and VERIFY the robot arrived. Returns success.
 
-        The previous version was fire-and-forget: on a service TIMEOUT it logged
-        a warning, skipped the fallback entirely (the fallback was gated on
-        returncode != 0, which a TimeoutExpired never reaches) and returned. Two
-        of twenty smoke trials hit that path and were still recorded as normal
-        rows, one of them as SUCCESS. Verification now uses the ground-truth
-        pose already streaming on /gazebo/model_states, so confirming costs
-        nothing extra.
+        Uses one in-process SetEntityState client on /gazebo/set_entity_state
+        (the world's gazebo_ros_state plugin). It used to shell out to
+        `bash -c "source ... && ros2 service call ..."` for up to four service
+        names per attempt, each a fresh CLI process with its own DDS discovery
+        (2-5 s each, and 5 s timeouts were hit under GPU load in the
+        2026-11-12 smoke test). Twist is zeroed so the robot does not carry
+        momentum into the next probe. AMCL is re-seeded AFTER the teleport is
+        verified, at the verified pose (it used to be told before the move).
         """
+        from gazebo_msgs.srv import SetEntityState
+        node = self._recorder
+        if getattr(self, "_set_entity_cli", None) is None:
+            self._set_entity_cli = node.create_client(SetEntityState, "/gazebo/set_entity_state")
+        cli = self._set_entity_cli
         _, _, qz, qw = yaw_to_quaternion(float(pose["yaw"]))
-        entity_payload = (
-            f'{{"state": {{"name": "{self.gazebo_robot_model}", '
-            f'"pose": {{"position": {{"x": {pose["x"]}, "y": {pose["y"]}, "z": 0.001}}, '
-            f'"orientation": {{"z": {qz}, "w": {qw}}}}}}}}}'
-        )
-        model_payload = (
-            f'{{"model_state": {{"model_name": "{self.gazebo_robot_model}", '
-            f'"pose": {{"position": {{"x": {pose["x"]}, "y": {pose["y"]}, "z": 0.001}}, '
-            f'"orientation": {{"z": {qz}, "w": {qw}}}}}}}}}'
-        )
-        services = (
-            ("/gazebo/set_entity_state", "gazebo_msgs/srv/SetEntityState", entity_payload),
-            ("/gazebo/set_model_state", "gazebo_msgs/srv/SetModelState", model_payload),
-            ("/set_model_state", "gazebo_msgs/srv/SetModelState", model_payload),
-            ("/set_entity_state", "gazebo_msgs/srv/SetEntityState", entity_payload),
-        )
-
-        # Publish /initialpose to AMCL and Nav2 immediately
-        self._publish_initial_pose(pose)
-
-        src_prefix = "source /opt/ros/humble/setup.bash && " if os.path.exists("/opt/ros/humble/setup.bash") else ""
 
         for attempt in range(1, attempts + 1):
-            for srv, typ, payload in services:
-                try:
-                    cmd_str = f"{src_prefix}ros2 service call {srv} {typ} '{payload}'"
-                    cmd = ["bash", "-c", cmd_str]
-                    subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    logger.warning(
-                        f"  {srv} timed out (attempt {attempt}/{attempts})")
-                    continue
-                except Exception as e:
-                    logger.warning(f"  {srv} failed: {e}")
-                    continue
-
-                if self._verify_gazebo_pose(pose, tol_xy=tol_xy):
-                    logger.info(
-                        f"  Teleported to ({pose['x']:.2f}, {pose['y']:.2f}) ✓")
-                    return True
+            if not cli.wait_for_service(timeout_sec=5.0):
+                logger.warning(f"  /gazebo/set_entity_state unavailable (attempt {attempt}/{attempts})")
+                continue
+            req = SetEntityState.Request()
+            req.state.name = self.gazebo_robot_model
+            req.state.reference_frame = "world"
+            req.state.pose.position.x = float(pose["x"])
+            req.state.pose.position.y = float(pose["y"])
+            req.state.pose.position.z = 0.001
+            req.state.pose.orientation.z = float(qz)
+            req.state.pose.orientation.w = float(qw)
+            fut = cli.call_async(req)          # the executor thread spins `node`
+            t_end = time.time() + 5.0
+            while not fut.done() and time.time() < t_end:
+                time.sleep(0.02)
+            if not fut.done():
+                fut.cancel()
+                logger.warning(f"  set_entity_state timed out (attempt {attempt}/{attempts})")
+                continue
+            res = fut.result()
+            if res is None or not res.success:
+                logger.warning(f"  set_entity_state refused (attempt {attempt}/{attempts})")
+                continue
+            if self._verify_gazebo_pose(pose, tol_xy=tol_xy):
+                gx, gy, gyaw = node.pose()
+                self._publish_initial_pose({"x": gx, "y": gy, "yaw": gyaw})
+                logger.info(f"  Teleported to ({pose['x']:.2f}, {pose['y']:.2f}) ✓")
+                return True
             time.sleep(0.5)
 
-        gx, gy, _ = self._recorder.pose()
+        gx, gy, _ = node.pose()
         logger.error(
             f"  TELEPORT UNVERIFIED after {attempts} attempts. Requested "
             f"({pose['x']:.2f}, {pose['y']:.2f}), ground truth reports "
@@ -2304,8 +2500,8 @@ class TrialRunner:
         path = os.path.join(self.output_dir, "trials",
                             f"trial_{self.run_id}_{probe_id:05d}.json")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(self._json_safe(payload), f, indent=2)
+        from rct_collector.durable import write_json_durable
+        write_json_durable(path, self._json_safe(payload))
         return path
 
     def _finalize_json(self, rec: TrialRunnerNode, result: TrialResult, params: dict,
@@ -2390,8 +2586,8 @@ class TrialRunner:
         path = os.path.join(self.output_dir, "trials",
                             f"trial_{self.run_id}_{trial_str}.json")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(self._json_safe(payload), f, indent=2)
+        from rct_collector.durable import write_json_durable
+        write_json_durable(path, self._json_safe(payload))
         result.json_path = path
 
         if self.generate_plots:

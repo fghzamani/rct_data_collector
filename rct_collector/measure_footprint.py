@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """measure_footprint.py — capture a matching (joints, footprint) pair for one arm pose.
 
+WARNING (2026-11-13): this approximates the arm by its link ORIGINS + a buffer
+and misses the gripper fingers (collision boxes reach 0.23 m past gripper_link):
+the carry polygon it produced left them 4-5 cm outside, and it says nothing
+about the swing between poses. Use src/rct_data_collector/tools/arm_footprint_fk.py (exact URDF
+collision geometry by forward kinematics, over recorded swings) instead.
+
 Hold TIAGo's arm in the pose you want (tuck it, or extend it to the side), then
 run this. It reads the *current* arm joint angles from /joint_states AND the live
 TF of every arm/wrist/gripper link, projects those links onto the ground plane in
@@ -107,6 +113,12 @@ def inscribed_radius(poly):
     return best
 
 
+def _quat_to_rot(x, y, z, w):
+    return np.array([[1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+                     [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+                     [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)]])
+
+
 class FootprintMeasurer(Node):
     def __init__(self, args):
         super().__init__("footprint_measurer")
@@ -174,6 +186,7 @@ class FootprintMeasurer(Node):
 
         # 4. build the point cloud: base outline (raw) + densified, buffered arm chain
         pts = list(octagon(self.args.base_radius))
+        n_base = len(pts)          # the base outline is exact; --margin applies to the arm only
         chain = np.vstack([[0.0, 0.0]] + pts_arm)   # start at base origin
         order = np.argsort(np.hypot(chain[:, 0], chain[:, 1]))  # sort outward
         chain = chain[order]
@@ -181,6 +194,33 @@ class FootprintMeasurer(Node):
                            for i in range(len(chain)-1)]) if len(chain) > 1 else chain
         for p in dense:
             pts.extend(circle_pts(p, self.args.link_buffer, 6))
+
+        # 4b. rigid boxes carried by the arm (e.g. payload_box on gripper_link):
+        #     their 8 corners, rotated with the frame, projected to the ground.
+        #     Link ORIGINS + link_buffer cannot see a 25 cm box whose corners
+        #     sit up to 0.18 m from its frame origin (the first carry polygon
+        #     left 9 cm of the box outside the footprint).
+        for spec in self.args.box:
+            frame, dims = spec.split(":")
+            sx, sy, sz = (float(v) / 2 for v in dims.split(","))
+            try:
+                tf = self._tf_buf.lookup_transform(
+                    base, frame, rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.5))
+            except Exception as exc:   # noqa: BLE001
+                self.get_logger().error(f"box frame {frame}: {exc}")
+                return
+            t, q = tf.transform.translation, tf.transform.rotation
+            R = _quat_to_rot(q.x, q.y, q.z, q.w)
+            for cx in (-sx, sx):
+                for cy in (-sy, sy):
+                    for cz in (-sz, sz):
+                        c = R @ np.array([cx, cy, cz])
+                        pts.append((t.x + c[0], t.y + c[1]))
+            got.append(f"{frame}[box {dims}]")
+        if self.args.margin > 0:
+            pts = pts[:n_base] + [q2 for p in pts[n_base:]
+                                  for q2 in circle_pts(p, self.args.margin, 6)]
 
         hull = drop_collinear(convex_hull(np.array(pts)))
 
@@ -190,7 +230,7 @@ class FootprintMeasurer(Node):
 
         # 5. emit a ready-to-paste ARM_CONFIGS entry
         joints_str = ("[" + ", ".join(str(v) for v in joints) + "]") if joints else "None  # capture failed"
-        mode = "play_motion" if self.args.label == "tucked" else "joint_trajectory"
+        mode = "joint_trajectory"   # play_motion2/MoveIt does not know the payload box
         extra = '\n        "motion_name": "home",' if self.args.label == "tucked" else ""
         print("\n" + "="*70)
         print(f"Measured pose '{self.args.label}'  (base frame: {base})")
@@ -224,6 +264,11 @@ def main():
                    help="regex; TF frames matching it are treated as arm links")
     p.add_argument("--links", default="",
                    help="explicit comma-separated frame list (overrides --link-filter)")
+    p.add_argument("--box", action="append", default=[], metavar="FRAME:SX,SY,SZ",
+                   help="a rigid box on the arm, e.g. payload_box:0.25,0.25,0.25 "
+                        "(repeatable); its rotated corners are added to the hull")
+    p.add_argument("--margin", type=float, default=0.0,
+                   help="extra clearance (m) added around every hull point")
     p.add_argument("--joint-topic", default="/joint_states")
     p.add_argument("--settle-sec", type=float, default=1.5,
                    help="seconds to let TF + joint_states populate before measuring")

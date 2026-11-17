@@ -31,6 +31,14 @@ import yaml
 
 from rct_collector.scripts.orchestrator import OrchestratorConfig, RCTOrchestrator
 
+# Module-level so helpers such as _config_from_yaml can log (it used to raise
+# NameError on any unknown YAML key).
+logger = logging.getLogger("rct_collector.main")
+
+# Process exit codes per stop reason, for a supervisor to act on.
+EXIT_CODES = {"OK": 0, "STOP_AT": 0, "INTERRUPTED": 2, "SIM_STALLED": 3,
+              "EXCEPTION": 4, "INTEGRITY_FAILURES": 5, "CONSECUTIVE_FAILURES": 6}
+
 
 def setup_logging(log_level: str = "INFO", log_file: str = None):
     handlers = [logging.StreamHandler(sys.stdout)]
@@ -49,7 +57,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="RCT Data Collector for Nav2")
     p.add_argument("--map", type=str, help="Path to map YAML file")
     p.add_argument("--trials", type=int, default=3000)
-    p.add_argument("--output", type=str, default="./rct_data")
+    p.add_argument("--output", type=str, default=None,
+                   help="Output directory (default: the config's output_dir, "
+                        "else ./rct_data). Only overrides the YAML when given.")
     p.add_argument("--timeout", type=float, default=180.0)
     p.add_argument("--cooldown", type=float, default=3.0)
     p.add_argument("--clearance", type=float, default=0.5)
@@ -70,6 +80,15 @@ def parse_args():
     p.add_argument("--max-distance", type=float, default=20.0)
     p.add_argument("--config", type=str, help="YAML config file")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--stop-at", type=int, default=None, metavar="PROBE_ID",
+                   help="Stop cleanly after this probe id (chunk boundary). "
+                        "num_trials, and so the checkpoint identity, is unchanged.")
+    p.add_argument("--attempt-kind", choices=["rerun", "replicate"], default="rerun",
+                   help="tag for --rerun-trials rows: rerun (replaces a quarantined "
+                        "attempt) or replicate (noise measurement, never accepted)")
+    p.add_argument("--rerun-trials", type=str, default=None, metavar="ID,ID,...",
+                   help="Re-run these already-completed probe ids (rows tagged "
+                        "attempt_kind=rerun); the checkpoint is not moved. Needs --resume.")
     p.add_argument("--visualize-only", action="store_true")
     p.add_argument("--n-samples", type=int, default=20,
                    help="Number of sample pairs to show in visualization (default: 20)")
@@ -105,7 +124,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=None)
 
     # --- Probe Data Collection -----------------------
-    p.add_argument("--n-probes", type=int, default=500,
+    p.add_argument("--n-probes", type=int, default=None,
                    help="Number of decision-point probes to run")
     p.add_argument("--horizon-sec", type=float, default=3.0,
                    help="Seconds to watch for a collision after candidate config is applied")
@@ -125,6 +144,45 @@ def parse_args():
                    help="Weight for wall-following stratum in v2 rooms pose sampling")
     p.add_argument("--open-weight", type=float, default=0.35,
                    help="Weight for open control stratum in v2 rooms pose sampling")
+    # --- pose-pool shape (campaign 2) ---
+    p.add_argument("--spatial-balance", action="store_true",
+                   help="Target equal start/goal quotas over --balance-cell squares "
+                        "of valid space (route stratum fills rooms a straight pair "
+                        "cannot reach)")
+    p.add_argument("--balance-cell", type=float, default=3.0,
+                   help="Side (m) of the spatial-balance squares")
+    p.add_argument("--min-region-area", type=float, default=1.0,
+                   help="Valid start area (m^2) a square needs to get a quota")
+    p.add_argument("--tight-fraction", type=float, default=0.0,
+                   help="Share of the pool whose route narrows into --tight-gap-band")
+    p.add_argument("--tight-gap-band", type=float, nargs=2, default=[0.65, 1.20],
+                   metavar=("LO", "HI"), help="Free-width band (m) for tight routes")
+    p.add_argument("--corridor-fraction", type=float, default=0.0,
+                   help="Share of the pool whose route runs through a corridor "
+                        "(passage < 1.8 m) after the earliest treatment point")
+    p.add_argument("--corridor-pose-clearance", type=float, default=0.50,
+                   help="Start/goal clearance (m) allowed inside corridors for the "
+                        "corridor share; probes spawn tucked (radius 0.325)")
+    p.add_argument("--corridor-min-len", type=float, default=2.0,
+                   help="Route metres required inside a corridor")
+    p.add_argument("--corridor-after", type=float, default=2.0,
+                   help="Corridor metres only count after this route distance (m)")
+    p.add_argument("--label-difficulty", action="store_true",
+                   help="Attach easy/difficult labels and mechanism tags to each pair")
+    p.add_argument("--dynamic-obstacle-xy", type=float, nargs=2, action="append",
+                   default=None, metavar=("X", "Y"),
+                   help="Blocking position of a small moving obstacle (repeatable)")
+    p.add_argument("--keepout-sweep", type=float, nargs=7, action="append", default=None,
+                   metavar=("SX", "SY", "BX", "BY", "YAW", "L", "W"),
+                   help="moving obstacle: box L x W at heading YAW sliding (SX,SY)->(BX,BY); "
+                        "no start/goal pose within --keepout-margin of its swept area "
+                        "(repeatable)")
+    p.add_argument("--keepout-margin", type=float, default=None,
+                   help="keep-out margin around each sweep (default: --clearance)")
+    p.add_argument("--dynamic-obstacle-seg", type=float, nargs=4, action="append",
+                   default=None, metavar=("X1", "Y1", "X2", "Y2"),
+                   help="Blocking extent of a long moving obstacle, e.g. a board "
+                        "(repeatable); routes within 1.5 m are tagged 'dynamic'")
     p.add_argument("--no-randomize-arm", dest="randomize_arm",
                    action="store_false", default=True,
                    help="Hold the arm at the baseline's captured label for every "
@@ -135,6 +193,26 @@ def parse_args():
                         "probe design the robot is already moving via MPPI during "
                         "baseline-settle-sec, so R should be non-degenerate without "
                         "it; this is a documented escape hatch, not the primary mechanism.")
+    p.add_argument("--xy-goal-tolerance", type=float, default=0.25,
+                   help="Runner XY goal tolerance (default 0.25)")
+    p.add_argument("--yaw-goal-tolerance", type=float, default=0.9,
+                   help="Runner Yaw goal tolerance (default 0.9, matching Nav2's general_goal_checker)")
+    p.add_argument("--no-check-goal-tolerance", dest="check_goal_tolerance",
+                   action="store_false", default=True,
+                   help="Skip checking goal tolerance against Nav2 live parameters")
+    p.add_argument("--footprint-policy", choices=["instant", "track_arm", "hold_tucked"], default="instant",
+                   help="Costmap footprint update policy: instant (default), track_arm, or hold_tucked")
+    p.add_argument("--trigger-early-frac", type=float, default=1.0,
+                   help="Fraction of admissible band for trigger: 1.0 = uniform random over entire drive (default 1.0)")
+    p.add_argument("--apply-mode", choices=["time", "distance", "early_time"], default="time",
+                   help="Treatment trigger mode: time (default, random wall clock delay) or distance")
+    p.add_argument("--t-apply-min", type=float, default=4.0,
+                   help="Minimum seconds after drive start before applying treatment (default 4.0)")
+    p.add_argument("--t-apply-max", type=float, default=8.0,
+                   help="Maximum seconds after drive start before applying treatment (default 8.0)")
+    p.add_argument("--no-start-horizon-after-arm-move", dest="start_horizon_after_arm_move",
+                   action="store_false", default=True,
+                   help="Do not delay horizon_sec countdown until arm reaches carry pose")
     return p.parse_args()
 
 
@@ -181,6 +259,20 @@ def main():
         or args.generate_poses is not None
         or args.generate_configs is not None
     )
+    # Resolve the output directory once: CLI, else the YAML's output_dir,
+    # else ./rct_data. --output used to default to ./rct_data and therefore
+    # ALWAYS override the YAML, so runs landed in the working directory.
+    if args.output is None:
+        _yaml_out = None
+        if args.config:
+            try:
+                with open(args.config) as _f:
+                    _yaml_out = (yaml.safe_load(_f) or {}).get("output_dir")
+            except OSError:
+                _yaml_out = None
+        args.output = _yaml_out or "./rct_data"
+    if not is_offline_mode:
+        os.makedirs(args.output, exist_ok=True)
     log_file = os.path.join(args.output, "rct.log") if not is_offline_mode else None
     setup_logging(args.log_level, log_file)
     logger = logging.getLogger(__name__)
@@ -232,12 +324,19 @@ def main():
             min_goal_distance=args.min_distance,
             max_goal_distance=args.max_distance,
             seed=args.seed,
-            footprint_clearance_m=args.footprint_clearance,
-            footprint_polygon=args.carry_footprint,
-            footprint_yaw_bins=args.footprint_yaw_bins,
-            footprint_safety_margin_m=args.footprint_margin,
         )
+        # PoseSampler has no footprint-aware check; these flags were passed
+        # through and crashed --generate-poses with a TypeError.
+        if (args.footprint_clearance or args.carry_footprint
+                or args.footprint_margin):
+            logger.warning("--footprint-clearance/--carry-footprint/--footprint-margin "
+                           "are not implemented by PoseSampler and are ignored; "
+                           "use --clearance for pose clearance")
         sampler.load_map()
+        if args.keepout_sweep:
+            sampler.apply_keepout_sweeps(
+                [tuple(v) for v in args.keepout_sweep],
+                args.keepout_margin if args.keepout_margin is not None else args.clearance)
         os.makedirs(args.output, exist_ok=True)
 
         # Generate poses mode
@@ -258,6 +357,19 @@ def main():
                 forward_distance_m=args.probe_goal_distance,
                 constriction=constriction_val,
                 constriction_kwargs=ckwargs,
+                spatial_balance=args.spatial_balance,
+                balance_cell_m=args.balance_cell,
+                min_region_area_m2=args.min_region_area,
+                tight_fraction=args.tight_fraction,
+                tight_gap_band=tuple(args.tight_gap_band),
+                corridor_fraction=args.corridor_fraction,
+                corridor_pose_clearance_m=args.corridor_pose_clearance,
+                corridor_min_m=args.corridor_min_len,
+                corridor_after_m=args.corridor_after,
+                label_difficulty=args.label_difficulty,
+                dynamic_obstacle_xy=([tuple(v) for v in (args.dynamic_obstacle_xy or [])]
+                                     + [tuple(v) for v in (args.dynamic_obstacle_seg or [])]
+                                     or None),
             )
 
             # Also save a visualization with the generated poses
@@ -299,11 +411,10 @@ def main():
             config.map_yaml_path = args.map
         if args.n_probes:
             config.num_trials = args.n_probes
-        elif getattr(args, "trials", None):
-            config.num_trials = args.trials
+        config.resume = bool(args.resume)
 
     else:
-        num_trials = args.n_probes if args.n_probes else getattr(args, "trials", 500)
+        num_trials = args.n_probes if args.n_probes else 500
         world_name = args.world_name
         if not world_name and args.map:
             world_name = os.path.basename(os.path.dirname(os.path.abspath(args.map)))
@@ -341,15 +452,43 @@ def main():
             arm_move_time_sec=args.arm_move_time,
             arm_move_on_change_only=not args.arm_move_every_trial,
             reset_gazebo_between_trials=not args.no_gazebo_reset,
+            xy_goal_tolerance=args.xy_goal_tolerance,
+            yaw_goal_tolerance=args.yaw_goal_tolerance,
+            check_goal_tolerance_against_nav2=args.check_goal_tolerance,
+            footprint_policy=args.footprint_policy,
+            trigger_early_frac=args.trigger_early_frac,
+            apply_mode=args.apply_mode,
+            t_apply_min_sec=args.t_apply_min,
+            t_apply_max_sec=args.t_apply_max,
+            start_horizon_after_arm_move=args.start_horizon_after_arm_move,
         )
 
     if not config.map_yaml_path and not args.resume:
         logger.error("--map required (or use --resume)")
         sys.exit(1)
 
+    config.resume = bool(args.resume)
+    if args.stop_at:
+        config.stop_at_trial = int(args.stop_at)
+    if args.rerun_trials:
+        config.rerun_trials = [int(t) for t in args.rerun_trials.split(",") if t.strip()]
+        config.rerun_kind = args.attempt_kind
+        if not args.resume:
+            logger.error("--rerun-trials needs --resume (it re-runs probes of an existing run)")
+            sys.exit(1)
     orchestrator = RCTOrchestrator(config)
     orchestrator.initialize()
     orchestrator.run()
+    reason = getattr(orchestrator, "exit_reason", "OK")
+    code = EXIT_CODES.get(reason, 1)
+    logger.info(f"exit_reason={reason} -> exit code {code}")
+    # Every data file is closed by now (CSV/JSON via with-blocks, checkpoint
+    # fsync'd). os._exit skips interpreter teardown, where rclpy/C++ threads
+    # aborted with SIGABRT (exit 134) AFTER a clean run, which a supervisor
+    # would have read as a crash.
+    logging.shutdown()
+    sys.stdout.flush(); sys.stderr.flush()
+    os._exit(code)
 
 
 if __name__ == "__main__":

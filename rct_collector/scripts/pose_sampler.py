@@ -57,6 +57,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import math
 import numpy as np
 import yaml
 from PIL import Image
@@ -291,6 +292,39 @@ class PoseSampler:
                     mask[r, c] = True
 
         return mask
+
+    def apply_keepout_sweeps(self, sweeps, margin_m: float) -> None:
+        """Forbid START and GOAL poses within margin_m of the area a moving
+        obstacle sweeps. sweeps: [(sx, sy, bx, by, yaw, L, W)] = a box L x W at
+        heading yaw sliding from (sx, sy) to (bx, by). Routes may still cross
+        the sweep -- that is the point of the obstacle -- but the robot must
+        never be spawned, or asked to stop, where the box can drive into it.
+        Call after load_map(), before generating."""
+        if not sweeps:
+            return
+        h, w = self.map_image.shape
+        cols, rows = np.meshgrid(np.arange(w), np.arange(h))
+        X = cols * self.resolution + self.origin_x
+        Y = (h - 1 - rows) * self.resolution + self.origin_y
+        swept = np.zeros((h, w), dtype=bool)
+        for sx, sy, bx, by, yaw, L, W in sweeps:
+            n = max(2, int(math.hypot(bx - sx, by - sy) / (self.resolution / 2)) + 1)
+            c, sn = math.cos(yaw), math.sin(yaw)
+            for t in np.linspace(0.0, 1.0, n):
+                cx, cy = sx + t * (bx - sx), sy + t * (by - sy)
+                dx, dy = X - cx, Y - cy
+                u, v = c * dx + sn * dy, -sn * dx + c * dy
+                swept |= (np.abs(u) <= L / 2) & (np.abs(v) <= W / 2)
+        near = distance_transform_edt(~swept) * self.resolution <= margin_m
+        before = int(self.valid_mask.sum())
+        self.keepout_mask = near
+        self.valid_mask &= ~near
+        self.goal_mask &= ~near
+        self.valid_indices = np.argwhere(self.valid_mask)
+        self.goal_indices = np.argwhere(self.goal_mask)
+        logger.info(f"Keep-out around {len(sweeps)} moving-obstacle sweep(s) "
+                    f"(margin {margin_m:.2f} m): {before - int(self.valid_mask.sum())} "
+                    f"start cells removed")
 
     def _pixel_to_world(self, row: int, col: int) -> tuple[float, float]:
         """Convert pixel (row, col) to world coordinates (x, y)."""
@@ -773,6 +807,10 @@ class PoseSampler:
                 continue
             if not (self.valid_mask[s_row, s_col] and self.valid_mask[go_row, go_col]):
                 continue
+            # Region-targeted pool generation restricts where the start may be.
+            _sm = getattr(self, "_start_mask", None)
+            if _sm is not None and not _sm[s_row, s_col]:
+                continue
 
             # Different rooms: any feasible path must use a throat.
             room_s = int(self.room_labels[s_row, s_col])
@@ -997,8 +1035,411 @@ class PoseSampler:
         return s, g, False, "fallback", {}
 
     # ------------------------------------------------------------------ #
+    # Route stratum: pairs separated along the ROUTE, not a straight line
+    # ------------------------------------------------------------------ #
+
+    # Edge cost per metre follows Nav2's inflation layer + NavFn: a cell at
+    # clearance d < INFLATION costs 253*exp(-SCALING*(d - INSCRIBED)) on top
+    # of NavFn's neutral cost 50, so the multiplier is 1 + cost/50; beyond the
+    # inflation radius it is 1. Values are the pmb2 nav_public_sim defaults
+    # (inflation 0.55, scaling 3.0, robot_radius 0.275); the treatment moves
+    # inflation over 0.15-0.60, so routes are the BASELINE planner's. Being no
+    # more wall-averse than Nav2 matters: an earlier proxy charged up to
+    # 1.05 m and routed around every 1.2 m corridor Nav2 would happily take.
+    ROUTE_INFLATION_M = 0.55
+    ROUTE_COST_SCALING = 3.0
+    ROUTE_INSCRIBED_M = 0.275
+    NAVFN_NEUTRAL_COST = 50.0
+
+    # A corridor is a passage too narrow to hold a pose with the default
+    # carry clearance (0.90 m), i.e. local free width < 2 x 0.90 m, but wide
+    # enough for a tucked base. Width is read off the ridge of the clearance
+    # field: twice the largest clearance within half the max width.
+    CORRIDOR_MAX_WIDTH_M = 1.80
+    CORRIDOR_TAG_M = 1.5          # route metres in a corridor for the tag
+
+    def _build_corridor_mask(self):
+        from scipy.ndimage import maximum_filter
+        k = max(3, int(round(self.CORRIDOR_MAX_WIDTH_M / self.resolution)) | 1)
+        ridge = maximum_filter(np.where(self.nav_mask, self.dist_field, 0.0), size=k)
+        self.passage_width = 2.0 * ridge
+        self.corridor_mask = self.nav_mask & (self.passage_width < self.CORRIDOR_MAX_WIDTH_M)
+        logger.info(
+            f"Corridors: {self.corridor_mask.sum() * self.resolution ** 2:.1f} m^2 of "
+            f"passage narrower than {self.CORRIDOR_MAX_WIDTH_M} m")
+
+    def _build_route_graph(self):
+        """8-connected graph over cells where a tucked base fits."""
+        from scipy.sparse import csr_matrix
+        if getattr(self, "corridor_mask", None) is None:
+            self._build_corridor_mask()
+        nav = self.nav_mask
+        H, W = nav.shape
+        rr, cc = np.nonzero(nav)
+        idx = -np.ones((H, W), dtype=np.int64)
+        idx[rr, cc] = np.arange(len(rr))
+        d = self.dist_field
+        infl = 253.0 * np.exp(-self.ROUTE_COST_SCALING
+                              * np.maximum(d - self.ROUTE_INSCRIBED_M, 0.0))
+        shape = 1.0 + np.where(d < self.ROUTE_INFLATION_M, infl, 0.0) / self.NAVFN_NEUTRAL_COST
+        rows, cols, wts = [], [], []
+        for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+            r2, c2 = rr + dr, cc + dc
+            ok = (r2 >= 0) & (r2 < H) & (c2 >= 0) & (c2 < W)
+            r1, c1, r2, c2 = rr[ok], cc[ok], r2[ok], c2[ok]
+            ok = nav[r2, c2]
+            r1, c1, r2, c2 = r1[ok], c1[ok], r2[ok], c2[ok]
+            step = self.resolution * (np.sqrt(2.0) if dr and dc else 1.0)
+            w = step * 0.5 * (shape[r1, c1] + shape[r2, c2])
+            a, b = idx[r1, c1], idx[r2, c2]
+            rows += [a, b]; cols += [b, a]; wts += [w, w]
+        n = len(rr)
+        self._route_graph = csr_matrix(
+            (np.concatenate(wts), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(n, n))
+        self._route_rc = np.stack([rr, cc], axis=1)
+        self._route_idx = idx
+        self._route_clr = self.dist_field[rr, cc]
+        self._route_valid = self.valid_mask[rr, cc]
+        self._route_corr = self.corridor_mask[rr, cc]
+        self._route_gate = np.zeros(n, dtype=bool)
+        if self.gateway_rc is not None and len(self.gateway_rc):
+            g = idx[self.gateway_rc[:, 0], self.gateway_rc[:, 1]]
+            self._route_gate[g[g >= 0]] = True
+
+    def _route_tree(self, s):
+        """Cheapest-route tree from node ``s``.
+
+        Returns (pred, length_m, min_clearance_m, crosses_throat, corridor_m),
+        each per node, for the route to that node. Path sums are taken by pointer
+        jumping over the predecessor tree, so the whole map costs ~12 vector
+        passes instead of a Python walk per goal.
+        """
+        from scipy.sparse.csgraph import dijkstra
+        cost, pred = dijkstra(self._route_graph, indices=s,
+                              return_predecessors=True)
+        n = len(cost)
+        reached = np.isfinite(cost)
+        anc = np.where(pred >= 0, pred, np.arange(n))
+        rc = self._route_rc
+        d = rc - rc[anc]
+        val = self.resolution * np.hypot(d[:, 0], d[:, 1])
+        val[~reached] = np.inf
+        cor = np.where(self._route_corr, val, 0.0)
+        cor[~reached] = 0.0
+        mn = self._route_clr.copy()
+        gt = self._route_gate.copy()
+        a = anc.copy()
+        for _ in range(int(np.ceil(np.log2(max(n, 2)))) + 1):
+            val = val + val[a]
+            cor = cor + cor[a]
+            mn = np.minimum(mn, mn[a])
+            gt = gt | gt[a]
+            a = a[a]
+        return pred, val, mn, gt, cor
+
+    def sample_route_probe_pose(
+        self,
+        start_cells: Optional[np.ndarray] = None,
+        d_min_m: float = 9.0,
+        d_max_m: float = 10.9,
+        goal_weight_fn=None,
+        gap_band: Optional[tuple] = None,
+        min_euclid_frac: float = 0.5,
+        initial_turn_deg: tuple = (0.0, 180.0),
+        goal_yaw_offset_deg: float = 180.0,
+        max_attempts: int = 6,
+        goal_node_mask: Optional[np.ndarray] = None,
+        min_corridor_m: Optional[float] = None,
+        corridor_after_m: float = 0.0,
+        **_ignored,
+    ):
+        """Pair whose cheapest ROUTE is ``d_min_m``..``d_max_m`` long.
+
+        The doorway / wall / open strata all need a straight, clear 9-11 m
+        line from the start, which small rooms cannot hold: on the campaign-2
+        map 19 of 50 start regions, including the north and south-east rooms,
+        never produce one. Here the goal is anywhere the route reaches at the
+        right length, so the start can be any valid cell and the route bends
+        through doorways as Nav2's would.
+
+        ``start_cells``      (N,2) rows/cols to draw the start from (default:
+                             all valid cells).
+        ``goal_weight_fn``   f(rows, cols) -> weights over candidate goals,
+                             used to steer goals into under-filled regions.
+                             All-zero weights fall back to uniform, and
+                             meta['goal_weight_zero'] says so.
+        ``gap_band``         keep only goals whose route narrows to a free
+                             width (2 x clearance) in [lo, hi).
+        ``min_euclid_frac``  goal at least this fraction of ``d_min_m`` away in
+                             a straight line, so a route doubling back round
+                             one wall does not count as a 9 m probe.
+        ``goal_node_mask``   per route-graph node, where a goal may sit
+                             (default: valid cells, i.e. obstacle_clearance_m).
+        ``min_corridor_m``   keep only routes with at least this many metres
+                             inside ``corridor_mask`` AFTER the first
+                             ``corridor_after_m`` metres, i.e. after the
+                             earliest point the treatment can land.
+        """
+        if getattr(self, "_route_graph", None) is None:
+            self._build_route_graph()
+        cells = self.valid_indices if start_cells is None else start_cells
+        if len(cells) == 0:
+            return None
+        rc = self._route_rc
+        for _ in range(max_attempts):
+            sr, sc = cells[int(self.rng.integers(len(cells)))]
+            s = int(self._route_idx[sr, sc])
+            if s < 0:
+                continue
+            pred, length, mn, gt, cor = self._route_tree(s)
+            eu = self.resolution * np.hypot(rc[:, 0] - sr, rc[:, 1] - sc)
+            gmask = self._route_valid if goal_node_mask is None else goal_node_mask
+            cand = (gmask & (length >= d_min_m) & (length <= d_max_m)
+                    & (eu >= min_euclid_frac * d_min_m))
+            if min_corridor_m is not None:
+                cand &= cor >= min_corridor_m
+            if gap_band is not None:
+                gap = 2.0 * mn
+                cand &= (gap >= gap_band[0]) & (gap < gap_band[1])
+            ci = np.nonzero(cand)[0]
+            if len(ci) == 0:
+                continue
+            w = None
+            zero = False
+            if goal_weight_fn is not None:
+                w = np.asarray(goal_weight_fn(rc[ci, 0], rc[ci, 1]), dtype=float)
+                if w.sum() <= 0:
+                    w, zero = None, True
+            p = None if w is None else w / w.sum()
+            picked = None
+            for _pick in range(15 if min_corridor_m is not None else 1):
+                g = int(ci[self.rng.choice(len(ci), p=p)])
+                path = [g]
+                while path[-1] != s:
+                    path.append(int(pred[path[-1]]))
+                path = path[::-1]
+                pxy = np.array([self._pixel_to_world(int(r), int(c))
+                                for r, c in rc[path]])
+                seg = np.hypot(*np.diff(pxy, axis=0).T)
+                cum = np.concatenate([[0.0], np.cumsum(seg)])
+                late_corr = float(seg[(cum[1:] > corridor_after_m)
+                                      & self._route_corr[path[1:]]].sum())
+                if min_corridor_m is None or late_corr >= min_corridor_m:
+                    picked = g
+                    break
+            if picked is None:
+                continue
+            t = np.arange(0.0, cum[-1], 0.25)
+            route_xy = np.stack([np.interp(t, cum, pxy[:, 0]),
+                                 np.interp(t, cum, pxy[:, 1])], axis=1)
+            k1 = min(len(route_xy) - 1, 4)          # ~1 m ahead
+            k0 = max(0, len(route_xy) - 5)          # ~1 m before the goal
+            bearing = float(np.arctan2(route_xy[k1, 1] - pxy[0, 1],
+                                       route_xy[k1, 0] - pxy[0, 0]))
+            final = float(np.arctan2(pxy[-1, 1] - route_xy[k0, 1],
+                                     pxy[-1, 0] - route_xy[k0, 0]))
+            turn = self._draw_turn(initial_turn_deg)
+            start_yaw = float(np.mod(bearing + turn + np.pi, 2 * np.pi) - np.pi)
+            gy_off = np.radians(goal_yaw_offset_deg)
+            goal_yaw = float(np.mod(
+                final + self.rng.uniform(-gy_off, gy_off) + np.pi, 2 * np.pi) - np.pi)
+
+            gr, gc = rc[g]
+            room_s = int(self.room_labels[sr, sc])
+            room_g = int(self.room_labels[gr, gc])
+            crossed = bool(gt[g]) or (room_s > 0 and room_g > 0 and room_s != room_g)
+            sx, sy = pxy[0]
+            gx, gy = pxy[-1]
+            meta = {
+                "route_length_m": round(float(length[g]), 3),
+                "route_min_clearance_m": round(float(mn[g]), 3),
+                "route_min_gap_m": round(2.0 * float(mn[g]), 3),
+                "route_crosses_throat": bool(gt[g]),
+                "route_corridor_m": round(float(cor[g]), 2),
+                "route_corridor_after_apply_m": round(late_corr, 2),
+                "room_start": room_s,
+                "room_goal": room_g,
+                "initial_turn_deg": round(float(np.degrees(turn)), 1),
+                "_route_xy": route_xy,
+            }
+            if zero:
+                meta["goal_weight_zero"] = True
+            return (
+                {"x": float(sx), "y": float(sy), "yaw": start_yaw},
+                {"x": float(gx), "y": float(gy), "yaw": goal_yaw},
+                crossed, "route", meta,
+            )
+        return None
+
+    # ------------------------------------------------------------------ #
     # Pool generation
     # ------------------------------------------------------------------ #
+
+    # Geometry of the difficulty labels. carry_radius_m (0.847) is the
+    # CIRCUMSCRIBED radius of the carry polygon, so 2x it is the width the arm
+    # needs to rotate freely; CARRY_WIDTH_M is its lateral extent going straight.
+    CARRY_WIDTH_M = 0.97
+    NARROW_GAP_M = 1.20          # carry must squeeze or retract below this
+    # pal_office is open: obstacle fraction within 1 m of a route peaks at 0.09
+    # and its median is 0.009, so "dense" is the top few percent of THIS map,
+    # not an absolute occupancy. Recalibrate if the world changes.
+    DENSE_FRAC = 0.05
+    DENSE_BAND_M = 1.0
+    DYNAMIC_NEAR_M = 1.5
+
+    @staticmethod
+    def _as_segments(dynamic_xy):
+        """None | (x, y) | (x1, y1, x2, y2) | list of those -> list of 4-tuples."""
+        if dynamic_xy is None:
+            return []
+        if len(dynamic_xy) and not hasattr(dynamic_xy[0], "__len__"):
+            dynamic_xy = [dynamic_xy]
+        out = []
+        for d in dynamic_xy:
+            d = [float(v) for v in d]
+            out.append(tuple(d) if len(d) == 4 else (d[0], d[1], d[0], d[1]))
+        return out
+
+    def classify_difficulty(self, start, goal, meta=None, dynamic_xy=None):
+        """Label a pose pair easy/difficult and say WHY.
+
+        Difficulty is what makes the arm state matter, so each tag names a
+        mechanism the tuner has to react to rather than a generic score:
+
+          corner    the robot must turn more than 90 deg before making progress
+          doorway   the straight route crosses a room-to-room throat
+          narrow    the tightest passage is under NARROW_GAP_M but a tucked
+                    base still fits, so the carry envelope must squeeze
+          detour    the straight line is blocked outright, so the real plan has
+                    to go around: a different problem from squeezing through
+          dense     obstacles crowd the corridor on both sides
+          dynamic   the route passes close to where the moving obstacle blocks
+
+        Measured on the straight start->goal segment. That segment is NOT the
+        planned path: where it clips a wall the gap reads ~0 and the planner
+        will detour instead, which is why 'detour' and 'narrow' are separate
+        tags rather than one threshold. Treat these as route-difficulty priors
+        to stratify on, not as measurements of the executed path.
+        Returns a dict; 'class' is easy when no tag fires.
+        """
+        import numpy as _np
+        meta = meta or {}
+        x0, y0, x1, y1 = start["x"], start["y"], goal["x"], goal["y"]
+        n = max(2, int(_np.hypot(x1 - x0, y1 - y0) / self.resolution))
+        xs = _np.linspace(x0, x1, n); ys = _np.linspace(y0, y1, n)
+
+        # Straight-segment gap, kept for the 'detour' tag in every case.
+        _g = [2.0 * float(self.dist_field[r, c]) for r, c in
+              (self._world_to_pixel(x, y) for x, y in zip(xs, ys))
+              if self._in_grid(r, c)]
+        straight_gap = float(min(_g)) if _g else 0.0
+
+        # Route-stratum pairs carry their route: measure on it instead, since
+        # the straight segment of a bent route runs through walls.
+        route_xy = meta.get("_route_xy")
+        on_route = route_xy is not None and len(route_xy) >= 2
+        if on_route:
+            xs, ys = _np.asarray(route_xy)[:, 0], _np.asarray(route_xy)[:, 1]
+
+        gaps, occ_hits, occ_tot = [], 0, 0
+        band = int(round(self.DENSE_BAND_M / self.resolution))
+        for x, y in zip(xs, ys):
+            r, c = self._world_to_pixel(x, y)
+            if not self._in_grid(r, c):
+                continue
+            gaps.append(2.0 * float(self.dist_field[r, c]))
+            r0, r1 = max(0, r - band), min(self.free_mask.shape[0], r + band + 1)
+            c0, c1 = max(0, c - band), min(self.free_mask.shape[1], c + band + 1)
+            win = self.free_mask[r0:r1, c0:c1]
+            occ_hits += int((~win).sum()); occ_tot += int(win.size)
+
+        min_gap = float(min(gaps)) if gaps else 0.0
+        dens = (occ_hits / occ_tot) if occ_tot else 0.0
+
+        # Moving obstacles, each a blocking segment (x1, y1, x2, y2); a point
+        # (x, y) is a zero-length segment. Distance is from the route to the
+        # nearest segment, and 'dynamic_sites' says which ones are near.
+        d_dyn = float("inf")
+        near_sites = []
+        for k, seg in enumerate(self._as_segments(dynamic_xy)):
+            ax, ay, bx, by = seg
+            ex, ey = bx - ax, by - ay
+            L2 = ex * ex + ey * ey
+            t = (_np.clip(((xs - ax) * ex + (ys - ay) * ey) / L2, 0.0, 1.0)
+                 if L2 > 0 else _np.zeros_like(xs))
+            d = float(_np.min(_np.hypot(xs - (ax + t * ex), ys - (ay + t * ey))))
+            if d <= self.DYNAMIC_NEAR_M:
+                near_sites.append(k)
+            d_dyn = min(d_dyn, d)
+
+        # Metres of the measured line inside a corridor (passage < 1.8 m).
+        if getattr(self, "corridor_mask", None) is None:
+            self._build_corridor_mask()
+        _pts = [self._world_to_pixel(x, y) for x, y in zip(xs, ys)]
+        _in = [self._in_grid(r, c) and bool(self.corridor_mask[r, c]) for r, c in _pts]
+        _len = float(_np.hypot(_np.diff(xs), _np.diff(ys)).sum())
+        corr_m = _len * (sum(_in) / max(len(_in), 1))
+
+        turn = float(meta.get("initial_turn_deg", 0.0) or 0.0)
+        tags = []
+        if abs(turn) >= 90.0:
+            tags.append("corner")
+        if meta.get("stratum") == "doorway" or meta.get("crossed"):
+            tags.append("doorway")
+        nav_diam = 2.0 * self.nav_radius_m
+        if on_route:
+            # Route known: detour and narrow are separate facts about it.
+            if straight_gap < nav_diam:
+                tags.append("detour")
+            if min_gap < self.NARROW_GAP_M:
+                tags.append("narrow")
+        elif min_gap < nav_diam:
+            tags.append("detour")        # straight line blocked; plan must go around
+        elif min_gap < self.NARROW_GAP_M:
+            tags.append("narrow")        # tucked fits, carry must squeeze
+        if corr_m >= self.CORRIDOR_TAG_M:
+            tags.append("corridor")      # sustained squeeze, not a doorway
+        if dens > self.DENSE_FRAC:
+            tags.append("dense")
+        if d_dyn <= self.DYNAMIC_NEAR_M:
+            tags.append("dynamic")
+
+        return {
+            "class": "difficult" if tags else "easy",
+            "tags": tags,
+            "n_tags": len(tags),
+            "min_gap_m": round(min_gap, 3),
+            "straight_blocked": bool(straight_gap < 2.0 * self.nav_radius_m),
+            "measured_on": "route" if on_route else "straight",
+            "corridor_m": round(corr_m, 2),
+            "obstacle_frac": round(dens, 4),
+            "initial_turn_deg": round(abs(turn), 1),
+            "dist_to_dynamic_m": (None if d_dyn == float("inf") else round(d_dyn, 3)),
+            "dynamic_sites": near_sites,
+        }
+
+    def _draw_one(self, constriction, forward_distance_m, ck):
+        """One (start, goal, crossed, stratum, meta) draw for the chosen mode.
+
+        Factored out of generate_and_save so the pool generator can redraw a
+        pair that a spatial quota rejects, without duplicating the branch chain.
+        """
+        if constriction == "rooms":
+            start, goal, crossed, stratum, meta = self.sample_stratified_probe_pose(
+                d_min_m=forward_distance_m,
+                d_max_m=forward_distance_m + 1.9, **ck)
+            return start, goal, crossed, stratum, meta
+        if constriction == "enriched":
+            start, goal, crossed, stratum = self.sample_probe_pose_enriched(
+                forward_distance_m=forward_distance_m, **ck)
+            return start, goal, crossed, stratum, None
+        if constriction:
+            start, goal, crossed = self.sample_constriction_probe_pose(
+                forward_distance_m=forward_distance_m, **ck)
+            return start, goal, crossed, None, None
+        start, goal = self.sample_probe_pose(forward_distance_m=forward_distance_m)
+        return start, goal, None, None, None
 
     def generate_and_save(
         self,
@@ -1007,12 +1448,27 @@ class PoseSampler:
         forward_distance_m: float = 3.5,
         constriction: bool = False,
         constriction_kwargs: Optional[dict] = None,
+        spatial_balance: bool = False,
+        balance_cell_m: float = 3.0,
+        balance_oversample: int = 40,
+        label_difficulty: bool = False,
+        dynamic_obstacle_xy: Optional[tuple] = None,
+        tight_fraction: float = 0.0,
+        tight_gap_band: tuple = (0.65, 1.20),
+        min_region_area_m2: float = 1.0,
+        strata_tries_per_region: int = 3,
+        corridor_fraction: float = 0.0,
+        corridor_pose_clearance_m: float = 0.50,
+        corridor_min_m: float = 2.0,
+        corridor_after_m: float = 2.0,
     ) -> list[dict]:
         """
         Pre-generate n pose pairs and save them to a JSON file.
 
         Each entry has: {"start": {"x","y","yaw"}, "goal": {"x","y","yaw"},
         "distance": float, "crossed": bool, "stratum": str, "meta": {...}}.
+        With ``spatial_balance`` it also has "share" ("tight" / "spread") and
+        "start_region".
 
         ``constriction`` selects the probe sampler:
           "rooms"     v2 room-topology strata (recommended)
@@ -1020,53 +1476,379 @@ class PoseSampler:
           True        v1 single-constriction sampler
           False       plain forward probe
 
-        For "rooms", ``forward_distance_m`` sets the lower end of the pair
-        separation and the upper end is +1.9 m. Keep it near 3.6: the
-        orchestrator rejects any plan shorter than
-        ``guard + t_min_baseline`` (3.4 m with the shipped defaults) as
-        POSE_EXHAUSTED, and lengthening it past ~6 m re-widens the uniform
-        trigger draw and lets the treatment land far from the constriction.
+        ``spatial_balance`` spreads the pool over the map by TARGETING regions
+        rather than rejecting draws. Valid start space is cut into
+        ``balance_cell_m`` squares; squares with at least
+        ``min_region_area_m2`` of valid area get equal start quotas, and the
+        same squares get equal goal quotas. Each pair is drawn for a named
+        start region:
+
+          1. up to ``strata_tries_per_region`` stratified draws with the start
+             restricted to that region, kept only if the goal's region still
+             has quota (and, for the tight share, the straight gap is in band);
+          2. otherwise the route stratum (``sample_route_probe_pose``), which
+             picks a goal at the right ROUTE length, weighted toward goal
+             regions with quota left.
+
+        The previous version rejected draws against the quota and, after
+        ``balance_oversample`` rejections, kept the last draw anyway. Because
+        the straight-line strata cannot place a 9-11 m pair in small rooms,
+        that fallback fired constantly and the quota never bound: 21% of goals
+        landed in one 3 m cell. Targeting removes the fallback; a region that
+        cannot produce a pair at all is retired and its quota moved to the
+        live regions, and the log reports it.
+
+        ``tight_fraction`` reserves that share of the pool for pairs whose
+        route narrows to ``tight_gap_band`` metres of free width. That band is
+        where the arm state decides the outcome: a tucked base (0.65 m) fits,
+        a carry envelope (0.97 m) has to squeeze or give up. With balancing,
+        the tight share has its own start quotas over the regions that CAN
+        produce a tight route, so it spreads over every tight place on the map
+        instead of piling into the few nearest the sampler's favourite
+        throats.
+
+        ``corridor_fraction`` reserves that share for pairs whose route runs
+        at least ``corridor_min_m`` through a corridor (passage narrower than
+        CORRIDOR_MAX_WIDTH_M) after the first ``corridor_after_m`` metres, the
+        earliest the treatment can land. A doorway is a short squeeze; a
+        corridor holds the carry envelope tight for metres and allows no turn,
+        so it is a different mechanism and needs its own data. Corridors cannot
+        hold a pose with ``obstacle_clearance_m`` (0.90 m needs 1.8 m of
+        width), so for this share start and goal may also sit in a corridor
+        with ``corridor_pose_clearance_m``. That is safe because every probe
+        spawns under the baseline (tucked) arm; the carry footprint only
+        appears after the trigger. The corridor share is exempt from the start
+        quotas (corridors are few) but its goals still count against them.
+
+        For "rooms", ``forward_distance_m`` is the lower end of the pair
+        separation and the upper end is +1.9 m. The orchestrator rejects any
+        plan shorter than ``guard + 0.4`` with ``guard = v_max * H + 0.5``.
         """
         import json
 
         ck = dict(constriction_kwargs or {})
+        lo_gap, hi_gap = tight_gap_band
+        n_tight_target = int(round(tight_fraction * n_poses))
+        n_corr_target = int(round(corridor_fraction * n_poses))
+        if n_tight_target + n_corr_target > n_poses:
+            raise ValueError("tight_fraction + corridor_fraction exceeds 1")
+        d_min = forward_distance_m
+        d_max = forward_distance_m + 1.9
+
+        def _straight_min_gap(start, goal):
+            """Narrowest free width on the straight start->goal segment."""
+            n = max(2, int(np.hypot(goal["x"] - start["x"],
+                                    goal["y"] - start["y"]) / self.resolution))
+            g = []
+            for x, y in zip(np.linspace(start["x"], goal["x"], n),
+                            np.linspace(start["y"], goal["y"], n)):
+                r, c = self._world_to_pixel(x, y)
+                if self._in_grid(r, c):
+                    g.append(2.0 * float(self.dist_field[r, c]))
+            return min(g) if g else 0.0
+
+        def _gap_of(start, goal, meta):
+            if meta and "route_min_gap_m" in meta:
+                return meta["route_min_gap_m"]
+            return _straight_min_gap(start, goal)
+
+        _corr_ctx = {}
+
+        def _draw_corridor(goal_weight_fn=None, mode="end"):
+            """One corridor-share pair, or None.
+
+            mode  end      route ends inside the corridor (robot enters it late,
+                           likely after the treatment landed)
+                  through  start and goal outside: the robot traverses it and
+                           has to get out the other side
+                  start    spawn inside the corridor, so the arm can switch to
+                           carry while the robot is still in it
+            """
+            if not _corr_ctx:
+                if getattr(self, "_route_graph", None) is None:
+                    self._build_route_graph()
+                pose_ok = (self.free_mask & (self.dist_field >= corridor_pose_clearance_m)
+                           & (self.valid_mask | self.corridor_mask))
+                ko = getattr(self, "keepout_mask", None)
+                if ko is not None:
+                    pose_ok &= ~ko
+                near = distance_transform_edt(~self.corridor_mask) * self.resolution <= d_max
+                rc = self._route_rc
+                in_corr = self.corridor_mask[rc[:, 0], rc[:, 1]]
+                ok_n = pose_ok[rc[:, 0], rc[:, 1]]
+                _corr_ctx.update({
+                    "end": (np.argwhere(pose_ok & near), ok_n & in_corr),
+                    "through": (np.argwhere(pose_ok & near & ~self.corridor_mask),
+                                ok_n & ~in_corr),
+                    "start": (np.argwhere(pose_ok & self.corridor_mask), ok_n),
+                })
+            starts, gmask = _corr_ctx[mode]
+            out = self.sample_route_probe_pose(
+                start_cells=starts, d_min_m=d_min, d_max_m=d_max,
+                goal_weight_fn=goal_weight_fn, goal_node_mask=gmask,
+                min_corridor_m=corridor_min_m, corridor_after_m=corridor_after_m,
+                max_attempts=12,
+                **{k: v for k, v in ck.items() if k in ("initial_turn_deg",)})
+            if out is None:
+                return None
+            out[4]["corridor_mode"] = mode
+            return out[:3] + ("corridor",) + out[4:]
+
+        _corr_modes = ["end", "through", "start"]
+        _corr_dead = set()
+        _corr_i = [0]
+
+        def _next_corridor(goal_weight_fn=None):
+            """Cycle the corridor modes; retire a mode that cannot produce."""
+            for _ in range(len(_corr_modes)):
+                live = [m for m in _corr_modes if m not in _corr_dead]
+                if not live:
+                    return None
+                mode = live[_corr_i[0] % len(live)]
+                _corr_i[0] += 1
+                for _try in range(4):
+                    out = _draw_corridor(goal_weight_fn, mode)
+                    if out is not None:
+                        return out
+                _corr_dead.add(mode)
+                logger.warning(f"Corridor mode '{mode}' produced nothing; retired")
+            return None
+
+        draws = []          # (start, goal, crossed, stratum, meta, share, region)
+        region_of = None
+        stats = {"strata": 0, "route": 0, "goal_overflow": 0}
+        retired = {"tight": [], "spread": []}
+        n_corr_failed = 0
+
+        if spatial_balance:
+            if self.nav_mask is None:
+                raise RuntimeError("spatial_balance needs load_map() first")
+            step = max(1, int(round(balance_cell_m / self.resolution)))
+
+            def region_of(x, y):
+                r, c = self._world_to_pixel(x, y)
+                return (int(r // step), int(c // step))
+
+            V = self.valid_indices
+            keys = (V[:, 0] // step) * 100000 + V[:, 1] // step
+            uniq, counts = np.unique(keys, return_counts=True)
+            min_cells = int(np.ceil(min_region_area_m2 / self.resolution ** 2))
+            region_cells = {}
+            for k, n in zip(uniq, counts):
+                if n >= min_cells:
+                    region_cells[(int(k // 100000), int(k % 100000))] = V[keys == k]
+            regions = sorted(region_cells)
+            R = len(regions)
+            if R == 0:
+                raise RuntimeError("no region has enough valid area")
+
+            def _split(n):
+                """n spread as evenly as possible over the regions."""
+                q = {k: n // R for k in regions}
+                for k in self.rng.permutation(R)[: n - (n // R) * R]:
+                    q[regions[int(k)]] += 1
+                return q
+
+            goal_left = _split(n_poses)
+            start_left = {"tight": _split(n_tight_target),
+                          "spread": _split(n_poses - n_tight_target - n_corr_target)}
+            logger.info(
+                f"Spatial balancing (targeted): {R} regions of {balance_cell_m} m "
+                f"with >= {min_region_area_m2} m^2 valid start area; "
+                f"{n_tight_target} tight + {n_corr_target} corridor + "
+                f"{n_poses - n_tight_target - n_corr_target} spread pairs")
+
+            # Region shapes for the goal-weight lookup.
+            def _goal_weights(rows, cols):
+                return np.array([max(goal_left.get((int(r // step), int(c // step)), 0), 0)
+                                 for r, c in zip(rows, cols)], dtype=float)
+
+            _sw = ck.get("strata_weights") or {"doorway": 0.40, "wall": 0.25, "open": 0.35}
+            open_share = float(_sw.get("open", 0.0)) / max(sum(_sw.values()), 1e-9)
+            open_gap = 2.0 * (self.carry_radius_m + 0.15)
+            door_share = float(_sw.get("doorway", 0.0)) / max(sum(_sw.values()), 1e-9)
+            no_door = set()
+
+            # Draw stratified first, sized to the target region.
+            ck_t = dict(ck)
+            ck_t.setdefault("max_attempts", 200)
+
+            def _try_region(region, share):
+                cells = region_cells[region]
+                tight = share == "tight"
+                if constriction:
+                    full = self.valid_indices
+                    try:
+                        self.valid_indices = cells
+                        # the doorway stratum anchors on a throat, not on
+                        # valid_indices, so it needs the region as a mask
+                        sm = np.zeros(self.valid_mask.shape, dtype=bool)
+                        sm[cells[:, 0], cells[:, 1]] = True
+                        self._start_mask = sm
+                        # Doorway first, at its stratum weight and with its
+                        # own budget: inside the generic draw it shares a
+                        # 200-attempt cap that a region-restricted throat
+                        # draw almost never meets.
+                        if (constriction == "rooms" and region not in no_door
+                                and self.rng.random() < door_share):
+                            out = self.sample_doorway_probe_pose(
+                                d_min_m=d_min, d_max_m=d_max, max_attempts=4000,
+                                **{k: v for k, v in ck.items()
+                                   if k in ("initial_turn_deg",)})
+                            if out is None:
+                                no_door.add(region)
+                            else:
+                                s, g, cr, st, me = out
+                                if (goal_left.get(region_of(g["x"], g["y"]), 0) > 0
+                                        and (not tight or lo_gap <= _straight_min_gap(s, g) < hi_gap)):
+                                    stats["strata"] += 1
+                                    return out
+                        for _ in range(strata_tries_per_region):
+                            try:
+                                s, g, cr, st, me = self._draw_one(
+                                    constriction, forward_distance_m, ck_t)
+                            except RuntimeError:
+                                # the plain-probe fallback raises when the
+                                # region has no straight pair at all
+                                break
+                            if st in ("fallback", None) and constriction == "rooms":
+                                continue
+                            if region_of(s["x"], s["y"]) != region:
+                                continue
+                            if goal_left.get(region_of(g["x"], g["y"]), 0) <= 0:
+                                continue
+                            if tight and not (lo_gap <= _straight_min_gap(s, g) < hi_gap):
+                                continue
+                            stats["strata"] += 1
+                            return s, g, cr, st, me
+                    finally:
+                        self.valid_indices = full
+                        self._start_mask = None
+                # Route fallback. For the spread share, keep the open control
+                # at its stratum weight: the whole route clears the carry
+                # envelope plus margin, as sample_open_probe_pose requires.
+                rk = {k: v for k, v in ck.items() if k in ("initial_turn_deg",)}
+                bands = []
+                if tight:
+                    bands = [(lo_gap, hi_gap)]
+                else:
+                    if self.rng.random() < open_share:
+                        bands.append((open_gap, np.inf))
+                    bands.append(None)
+                out = None
+                for band in bands:
+                    out = self.sample_route_probe_pose(
+                        start_cells=cells, d_min_m=d_min, d_max_m=d_max,
+                        goal_weight_fn=_goal_weights, gap_band=band, **rk)
+                    if out is not None:
+                        if band is not None and not tight:
+                            out = out[:3] + ("route_open",) + out[4:]
+                        break
+                if out is None:
+                    return None
+                stats["route"] += 1
+                if out[4].get("goal_weight_zero"):
+                    stats["goal_overflow"] += 1
+                return out
+
+            # Job list: one job per quota unit, shuffled so the two shares
+            # interleave in the pool instead of sitting in blocks.
+            jobs = [(share, k) for share in ("tight", "spread")
+                    for k in regions for _ in range(start_left[share][k])]
+            jobs += [("corridor", None)] * n_corr_target
+            jobs = [jobs[int(i)] for i in self.rng.permutation(len(jobs))]
+            dead = {"tight": set(), "spread": set()}
+            assigned = {share: dict(start_left[share]) for share in start_left}
+            while jobs:
+                share, region = jobs.pop()
+                if share == "corridor":
+                    out = _next_corridor(_goal_weights)
+                    if out is None:
+                        n_corr_failed += 1
+                        if n_corr_failed > 10 * max(n_corr_target, 1):
+                            logger.warning("Corridor share starved; giving up on it")
+                            jobs = [j for j in jobs if j[0] != "corridor"]
+                        else:
+                            jobs.insert(0, (share, region))
+                        continue
+                    s, g, cr, st, me = out
+                    gr = region_of(g["x"], g["y"])
+                    if gr in goal_left:
+                        goal_left[gr] -= 1
+                    draws.append((s, g, cr, st, me, share,
+                                  region_of(s["x"], s["y"])))
+                    continue
+                out = None
+                if region not in dead[share]:
+                    out = _try_region(region, share)
+                if out is None:
+                    if region not in dead[share]:
+                        dead[share].add(region)
+                        retired[share].append(region)
+                    alive = [k for k in regions if k not in dead[share]]
+                    if not alive:
+                        logger.warning(f"No region can produce a {share} pair; "
+                                       f"pool will be short by one")
+                        continue
+                    # move the unit to the live region holding the fewest
+                    new = min(alive, key=lambda k: (assigned[share][k], self.rng.random()))
+                    assigned[share][new] += 1
+                    jobs.insert(0, (share, new))
+                    continue
+                s, g, cr, st, me = out
+                gr = region_of(g["x"], g["y"])
+                if gr in goal_left:
+                    goal_left[gr] -= 1
+                draws.append((s, g, cr, st, me, share, region))
+        else:
+            n_tight = 0
+            for _ in range(n_corr_target):
+                out = None
+                for _try in range(10):
+                    out = _next_corridor()
+                    if out is not None:
+                        break
+                if out is not None:
+                    draws.append(tuple(out) + ("corridor", None))
+            for i in range(n_poses - len(draws)):
+                want_tight = n_tight < n_tight_target
+                _tries = balance_oversample if want_tight else 1
+                got_tight = False
+                for _attempt in range(_tries):
+                    s, g, cr, st, me = self._draw_one(constriction, forward_distance_m, ck)
+                    if not want_tight:
+                        break
+                    if lo_gap <= _gap_of(s, g, me) < hi_gap:
+                        got_tight = True
+                        break
+                n_tight += int(got_tight)
+                draws.append((s, g, cr, st, me,
+                              "tight" if got_tight else "spread", None))
+
         poses = []
         n_crossed = 0
-        for i in range(n_poses):
-            crossed = None
-            stratum = None
-            meta = None
-            if constriction == "rooms":
-                start, goal, crossed, stratum, meta = \
-                    self.sample_stratified_probe_pose(
-                        d_min_m=forward_distance_m,
-                        d_max_m=forward_distance_m + 1.9, **ck)
+        for i, (start, goal, crossed, stratum, meta, share, region) in enumerate(draws):
+            if crossed is not None:
                 n_crossed += int(crossed)
-            elif constriction == "enriched":
-                start, goal, crossed, stratum = self.sample_probe_pose_enriched(
-                    forward_distance_m=forward_distance_m, **ck)
-                n_crossed += int(crossed)
-            elif constriction:
-                start, goal, crossed = self.sample_constriction_probe_pose(
-                    forward_distance_m=forward_distance_m, **ck)
-                n_crossed += int(crossed)
-            else:
-                start, goal = self.sample_probe_pose(forward_distance_m=forward_distance_m)
-
-            dist = float(np.sqrt((goal["x"] - start["x"]) ** 2
-                                 + (goal["y"] - start["y"]) ** 2))
-            entry = {
-                "id": i,
-                "start": start,
-                "goal": goal,
-                "distance": round(dist, 3),
-            }
+            dist = float(np.hypot(goal["x"] - start["x"], goal["y"] - start["y"]))
+            entry = {"id": i, "start": start, "goal": goal,
+                     "distance": round(dist, 3)}
             if crossed is not None:
                 entry["crossed"] = bool(crossed)
             if stratum is not None:
                 entry["stratum"] = stratum
+            if tight_fraction > 0 or spatial_balance:
+                entry["share"] = share
+            if region is not None:
+                entry["start_region"] = list(region)
+            if label_difficulty:
+                _m = dict(meta or {})
+                _m.setdefault("stratum", stratum)
+                _m.setdefault("crossed", crossed)
+                entry["difficulty"] = self.classify_difficulty(
+                    start, goal, _m, dynamic_xy=dynamic_obstacle_xy)
             if meta:
-                entry["meta"] = meta
+                entry["meta"] = {k: v for k, v in meta.items() if not k.startswith("_")}
             poses.append(entry)
 
         with open(output_path, "w") as f:
@@ -1074,6 +1856,23 @@ class PoseSampler:
 
         logger.info(f"Saved {len(poses)} pose pairs to {output_path}")
 
+        if spatial_balance:
+            from collections import Counter as _C
+            sc = _C(region_of(p["start"]["x"], p["start"]["y"]) for p in poses)
+            gc = _C(region_of(p["goal"]["x"], p["goal"]["y"]) for p in poses)
+            top_s = sc.most_common(1)[0][1] / max(len(poses), 1)
+            top_g = gc.most_common(1)[0][1] / max(len(poses), 1)
+            logger.info(
+                f"Spatial balance: starts over {len(sc)} regions "
+                f"(largest {100*top_s:.1f}%), goals over {len(gc)} regions "
+                f"(largest {100*top_g:.1f}%). Draws: {stats['strata']} stratified, "
+                f"{stats['route']} route; {stats['goal_overflow']} goals had no "
+                f"under-quota region in reach")
+            for share in ("tight", "spread"):
+                if retired[share]:
+                    logger.info(f"Regions retired for the {share} share "
+                                f"(cannot produce one): {len(retired[share])}")
+        n_tight = sum(1 for p in poses if p.get("share") == "tight")
         from collections import Counter
         if constriction in ("rooms", "enriched"):
             strata = Counter(p.get("stratum", "?") for p in poses)
@@ -1088,6 +1887,16 @@ class PoseSampler:
             logger.info(f"Constriction-crossing: {n_crossed}/{n_poses} "
                         f"({100*n_crossed/max(n_poses,1):.0f}%); the rest fell back "
                         "to ordinary probe poses.")
+
+        if tight_fraction > 0:
+            logger.info(f"Tight routes: {n_tight}/{n_tight_target} requested "
+                        f"in band {tight_gap_band} m")
+
+        if label_difficulty:
+            from collections import Counter as _C2
+            cls = _C2(p["difficulty"]["class"] for p in poses)
+            tags = _C2(t for p in poses for t in p["difficulty"]["tags"])
+            logger.info(f"Difficulty: {dict(cls)}  tags={dict(tags)}")
 
         distances = [p["distance"] for p in poses]
         logger.info(

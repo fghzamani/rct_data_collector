@@ -15,7 +15,9 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        ("share/" + package_name + "/config", ["config/default_config.yaml"]),
+        ("share/" + package_name + "/config", ["config/default_config.yaml",
+                                                "config/campaign2.yaml",
+                                                "config/campaign2_supervisor.yaml"]),
         ("share/" + package_name + "/launch", ["launch/rct_collection.launch.py"]),
         (os.path.join('share', package_name, 'behavior_trees'), glob('behavior_trees/*.xml')),
     ],
@@ -38,7 +40,11 @@ setup(
             # Standalone footprint measurement utility; run it once per arm pose    
             "measure_footprint = rct_collector.measure_footprint:main",
             # Interactive web visualizer tool for trial motion and recorded JSON data
-            "rct_visualize = rct_collector.scripts.visualizer:main"
+            "rct_visualize = rct_collector.scripts.visualizer:main",
+            # Campaign supervisor: pilot in the GUI, approve, then headless.
+            "rct_supervise = rct_collector.scripts.supervisor:main",
+            # Clean dataset from a campaign's append-only raw files.
+            "rct_build_dataset = rct_collector.scripts.build_dataset:main",
         ],
     },
 )

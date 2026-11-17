@@ -103,16 +103,37 @@ ARM_JOINT_NAMES = [
 # joints: 7 arm joint targets (radians), captured live and confirmed reachable.
 ARM_CONFIGS = {
     "tucked": {
-        "footprint": "[[-0.275, 0.000], [-0.238, -0.138], [-0.138, -0.238], [-0.000, -0.275], [0.138, -0.238], [0.209, -0.181], [0.238, -0.138], [0.275, 0.000], [0.252, 0.182], [0.217, 0.242], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]",
-        "mode": "play_motion",
-        "motion_name": "home",
+        "footprint": "[[-0.275, 0.000], [-0.238, -0.138], [-0.138, -0.238], [-0.000, -0.275], [0.243, -0.214], [0.276, -0.201], [0.291, -0.178], [0.295, -0.127], [0.297, 0.055], [0.281, 0.203], [0.257, 0.234], [0.238, 0.248], [0.204, 0.260], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]",
+        # Direct joint trajectory (the carry move played backwards), NOT
+        # play_motion2 'home': deterministic timing, no MoveIt in the loop. With
+        # the payload_box that ros2-tiago-dev had on gripper_link (removed
+        # 2026-11-13) MoveIt refused to plan 'home' from carry and the arm
+        # stayed in carry for probes 3-10 of the first campaign-2 pilot.
+        # Footprints re-measured on the box-free robot 2026-11-13: both match.
+        # 2026-11-13 (campaign restart): base outline + the folded arm's exact
+        # collision geometry (FK at the recorded tucked joint angles) + 3 cm.
+        # The previous polygon (base only) left arm_3_link 3.6 cm outside.
+        # Old: [[-0.275, 0.000], [-0.238, -0.138], [-0.138, -0.238], [-0.000, -0.275], [0.138, -0.238], [0.209, -0.181], [0.238, -0.138], [0.275, 0.000], [0.252, 0.182], [0.217, 0.242], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]
+        "mode": "joint_trajectory",
+        "motion_name": "home",   # same joint values; kept for reference only
         "joints": [0.50, -1.34, -0.48, 1.94, -1.49, 1.37, 0.0],
     },
     "carry": {
-        "footprint": "[[-0.275, 0.000], [-0.238, -0.138], [0.070, -0.476], [0.230, -0.641], [0.420, -0.698], [0.480, -0.698], [0.510, -0.646], [0.238, 0.138], [0.138, 0.238], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]",
+        # SWEPT ENVELOPE of the arm, 2026-11-13 (campaign 2 epoch 1). Convex
+        # hull of every URDF collision shape of arm_1..7, wrist, gripper and
+        # fingers, by forward kinematics over the joint angles Gazebo recorded
+        # in all 347 epoch-0 carry probes (tucked -> carry move + carry pose),
+        # plus the base outline, + 3 cm margin. Used with footprint_policy
+        # "instant": both costmaps hold it from BEFORE the arm moves.
+        #   src/rct_data_collector/tools/arm_footprint_fk.py envelope --stride 1 --margin 0.03
+        # The previous polygon (measure_footprint: link ORIGINS + 6 cm) left the
+        # gripper fingers 4-5 cm outside in the carry pose and up to 23.7 cm
+        # outside during the swing, in every carry probe; 61% collided, 203 of
+        # 210 by an arm/finger strike. It was:
+        # [[-0.275, 0.000], [-0.238, -0.138], [0.070, -0.476], [0.230, -0.641], [0.420, -0.698], [0.480, -0.698], [0.510, -0.646], [0.238, 0.138], [0.138, 0.238], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]
+        "footprint": "[[-0.289, -0.000], [-0.248, -0.140], [0.112, -0.580], [0.211, -0.675], [0.403, -0.723], [0.552, -0.723], [0.593, -0.647], [0.632, -0.455], [0.638, -0.323], [0.604, -0.066], [0.519, 0.131], [0.438, 0.248], [0.273, 0.304], [-0.001, 0.281], [-0.144, 0.249], [-0.248, 0.144]]",
         "mode": "joint_trajectory",
         "joints": [0, 0.15, -0.5, 1.2, 0.0, 0.8, 0.0],
-         
     },
 }
 
@@ -177,7 +198,17 @@ class ParameterSpace:
             ros_node="local_costmap/local_costmap",
             name="inflation_layer.inflation_radius",
             param_type="continuous",
-            low=0.15, high=0.60,
+            # 0.15-1.10 since 2026-11-13. Nav2 MPPI 1.1.20 CostCritic checks the
+            # full footprint only when the cell under the robot CENTRE costs at
+            # least the inflation cost at the footprint's circumscribed radius;
+            # beyond inflation_radius that cell costs 0, so the arm/base outside
+            # it is never checked. Critical radius: tucked 0.33 m, carry 0.91 m
+            # (swept envelope). The range must straddle BOTH so the data show
+            # each side of the threshold. With 0.15-0.60, 196/202 carry and
+            # 14/14 tucked wall strikes happened with the centre outside the
+            # inflation zone. Cost scaling is 5.0 (nav_campaign2.yaml) so a
+            # large radius mostly enables checking, with little extra push.
+            low=0.15, high=1.10,
             channel="geometry",
             extra_targets=[("global_costmap/global_costmap",
                             "inflation_layer.inflation_radius")],
@@ -192,7 +223,12 @@ class ParameterSpace:
             channel="footprint",
             apply_via="footprint",
             presets={k: v["footprint"] for k, v in ARM_CONFIGS.items()},
-            extra_targets=[],
+            # ONE causal knob applied to BOTH costmaps, exactly like
+            # inflation_radius above. This was emptied during the 2026-09
+            # campaign, which left the global planner planning against the
+            # baseline tucked polygon while the arm extended. Do not empty it
+            # again: the arm is the treatment, so the footprint must track it.
+            extra_targets=[("global_costmap/global_costmap", "footprint")],
         ),
     ]
 

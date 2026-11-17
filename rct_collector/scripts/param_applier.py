@@ -55,11 +55,17 @@ SET_REJECTED = "SET_REJECTED"
 SET_TIMEOUT = "SET_TIMEOUT"
 READBACK_FAILED = "READBACK_FAILED"
 NO_SERVICE = "NO_SERVICE"
+# A parameter declared in the ParameterSpace that the sampled configuration
+# never supplied, so no set was even attempted. Distinct from NO_SERVICE
+# (tried, node absent) because the failure is upstream, in the config.
+NOT_SUPPLIED = "NOT_SUPPLIED"
 
 #: Outcomes that mean the applied treatment is not known to equal the recorded
 #: treatment. A trial with any of these must not be used for causal estimation
 #: at face value.
-INTEGRITY_BREAKING = frozenset({MISMATCH, SET_REJECTED, SET_TIMEOUT, NO_SERVICE})
+# NOT_SUPPLIED included: a declared knob that was never applied must trip the
+# consecutive-integrity-failure abort, not just flag rows one by one.
+INTEGRITY_BREAKING = frozenset({MISMATCH, SET_REJECTED, SET_TIMEOUT, NO_SERVICE, NOT_SUPPLIED})
 
 
 class ParamOutcome:

@@ -1,0 +1,75 @@
+# Supervisor for RCT campaign 2.  ros2 run rct_collector rct_supervise {pilot|approve|run|status|stop}
+#
+# Paths are host paths; the container mounts /home/forough/phd_projects at the
+# same path, so they are valid in both.
+
+campaign_dir: /home/forough/phd_projects/online_tuner/campaigns/campaign2
+collector_config: /home/forough/phd_projects/online_tuner/src/rct_data_collector/config/campaign2.yaml
+
+pilot_probes: 10          # run in the GUI, then wait for approval
+chunk_probes: 100         # collector runs --stop-at in chunks of this many probes
+recycle_every_chunks: 3   # restart Gazebo + Nav2 every N chunks (~3.5 h) before drift builds up
+
+launch:
+  package: gazebo_simulation
+  file: gazebo_with_navigation.launch.py
+  args:
+    is_public_sim: "True"
+    navigation: "True"
+    world_name: pal_office_campaign2
+  gui_args:      {gzclient: "True",  rviz: "True"}
+  headless_args: {gzclient: "False", rviz: "False"}
+  ready_timeout_sec: 300  # /clock + navigate_to_pose + model_states
+  settle_sec: 20
+  # "process has died" for any of these in the launch log = stack broken
+  fatal_nodes: [gzserver, controller_server, planner_server, bt_navigator, amcl,
+                map_server, robot_state_publisher, velocity_smoother,
+                controller_obs_dynamic, collision_monitor]
+
+health:
+  # live (every second)
+  clock_stall_sec: 20         # sim clock frozen -> kill + restart + resume
+  rtf_live_window_sec: 30
+  rtf_live_min: 0.50          # sustained real-time factor below -> graceful restart
+  probe_timeout_sec: 300      # no new probe row for this long -> hang -> kill
+  collector_init_sec: 420     # extra allowance before the first row of a collector run
+  mem_preflight_min_mb: 900   # refuse to start the simulator with less RAM free
+  mem_soft_mb: 300            # below AND down > mem_leak_mb since stack start -> finish probe, restart
+  mem_leak_mb: 300
+  mem_hard_mb: 120            # below -> kill now (the OOM killer is next)
+  graceful_stop_sec: 150
+
+  # per probe (outcome-independent glitches -> quarantine + rerun)
+  tel_rate_min_hz: 15
+  sim_gap_max_s: 0.5          # largest gap between telemetry samples, before first contact
+  rtf_probe_min: 0.75         # worst 1 s real-time factor, before first contact
+  max_reruns: 2
+  rerun_batch: 20
+  degraded_window: 5          # this many recent probes ...
+  degraded_glitches: 2        # ... with this many glitches -> stack restart
+
+  # escalation -> HALT
+  max_restarts_per_hour: 4
+  max_bringup_failures: 3
+  max_exceptions_same_probe: 3
+
+  # data audit (scripts/data_audit.py; report: supervisor/audit_report.md)
+  fp_outside_tol_cm: 1.0        # arm geometry this far outside the costmap footprint = not covered
+  halt_fp_outside_share: 0.05   # HALT if > 5% of the last 50 probes are not covered
+  min_checked_probes: 40        # per arm, before judging collisions with the footprint checked
+  warn_coll_rate_fp_checked: 0.15
+  warn_smd: 0.10                # covariate balance between arms
+  warn_drift_z: 3.5             # outcome rate, last 200 vs earlier, per arm
+  warn_loc_err_p95_m: 0.30
+  min_events_per_arm: 50        # valid collisions AND stalls per arm projected by the last probe
+
+  # rolling statistics
+  stats_every: 25
+  fp_window: 50
+  halt_fp_sync_below: 0.95
+  halt_carry_share_outside: [0.25, 0.75]
+  warn_bands:
+    collision_rate: [0.03, 0.30]
+    stall_rate: [0.03, 0.40]
+    valid_rate: [0.85, 1.01]
+    vx_over_cap_median: [0.60, 1.40]

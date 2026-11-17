@@ -103,7 +103,7 @@ param_settle_sec: 0.0          # Pause after set, before read-back (costmap rebu
 # general_goal_checker.yaw_goal_tolerance was 0.45, so every SUCCESS was decided
 # by a threshold that appears nowhere in the CSV.
 xy_goal_tolerance: 0.35
-yaw_goal_tolerance: 0.65
+yaw_goal_tolerance: 0.9
 check_goal_tolerance_against_nav2: true
 
 # --- Dual outcome: success_true vs success_believed ---
@@ -196,11 +196,11 @@ risk_topic: "/risk_state"
 risk_inflation_radius_m: 0.30
 risk_cost_scaling_factor: 10.0
 
-apply_mode: "early_time"
-t_apply_min_sec: 0.5
-t_apply_max_sec: 1.0
+apply_mode: "time"
+t_apply_min_sec: 4.0
+t_apply_max_sec: 8.0
 footprint_policy: "instant"
-horizon_sec: 5.0
+horizon_sec: 8.0
 
 # --- Ground truth / QA ---
 # Outcomes (path length, final error, clearance, the early-stop tolerance check)
